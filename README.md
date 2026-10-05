@@ -27,7 +27,7 @@ Four CSVs are stored in a Databricks Volume:
 | diagnosis | 5 | diagnosis_code (D001–D005) | Diagnosis code + description |
 | hospital | 5 | hospital_id (H001–H005) | Hospital name, city, bed count |
 | patient | 5 | patient_id (P001–P005) | Patient name, gender, DOB, city |
-| visit | 10 | visit_id (V1001–V1010) | Visit details: patient, hospital, diagnosis, cost, dates |
+| visit | 8 | visit_id (V1001–V1008) | Visit details: patient, hospital, diagnosis, cost, dates |
 
 ---
 

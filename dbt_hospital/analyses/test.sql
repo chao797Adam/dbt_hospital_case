@@ -1,0 +1,1 @@
+select * from {{source('hospital_source', 'patient')}} limit 10

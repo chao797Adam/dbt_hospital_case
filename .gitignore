@@ -1,0 +1,10 @@
+dbt_hospital/target/
+dbt_hospital/dbt_packages/
+dbt_hospital/logs/
+dbt_hospital/.venv/
+dbt_hospital/__pycache__/
+logs/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

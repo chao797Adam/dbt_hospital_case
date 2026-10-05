@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: hospital_source
+    catalog: z_dbt_hospital
+    schema: source
+    tables:
+      - name: diagnosis
+      - name: patient
+      - name: hospital
+      - name: visit

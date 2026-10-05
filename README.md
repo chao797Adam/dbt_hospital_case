@@ -1,12 +1,13 @@
 # Healthcare Data Pipeline with Databricks + dbt
 
-An end-to-end data pipeline for a healthcare dataset, built on the **Medallion architecture** (Source → Bronze → Silver).
+An end-to-end data pipeline for a healthcare dataset, built on the **Medallion architecture** (Source → Bronze → Silver → Gold).
 
 The pipeline:
 - Ingests 4 CSV sources (diagnosis, hospital, patient, visit) from a Databricks Volume.
 - Loads them into a `source` schema using **Auto Loader**.
 - Amends schema and data types in a **Bronze** layer (dbt).
 - Builds dimensional models (SCD1) in a **Silver** layer (dbt).
+- Produces a KPI table for 30-day readmission analysis in a **Gold** layer (dbt).
 
 ---
 
@@ -96,7 +97,7 @@ z_dbt_hospital.source
 └── visit
 ```
 
-All columns are `string` (Auto Loader keeps CSV as strings). `_ingested_at` is a `timestamp`. `_rescued_data` is present but not used downstream.
+All columns are `string`. `_ingested_at` is a `timestamp`. `_rescued_data` is present but not used downstream.
 
 ---
 
@@ -157,10 +158,10 @@ FROM {{ source('hospital_source', 'visit') }}
 
 ### Key Points
 
-- **`_rescued_data` is dropped** (it is Auto Loader's fault-tolerance column).
+- **`_rescued_data` is dropped** (Auto Loader fault-tolerance column).
 - **`_ingested_at` is preserved** (audit column).
-- **IDs (`visit_id`, `patient_id`, `hospital_id`, `diagnosis_code`) remain `STRING`** because they contain prefixes (V, P, H, D).
-- **Only numeric fields (`bed_count`, `cost`) and dates are `CAST`.**
+- **IDs remain `STRING`** because they contain prefixes (V, P, H, D).
+- **Only numeric fields and dates are `CAST`.**
 
 ### `sources.yml`
 
@@ -198,7 +199,7 @@ All Silver models use:
 
 - **`materialized='incremental'`**: Process only new data.
 - **`unique_key`**: Identifies which row is "the same entity".
-- **`incremental_strategy='merge'`**: **This is what makes it SCD1** — matched rows are updated, unmatched rows are inserted.
+- **`incremental_strategy='merge'`**: **SCD1** — matched rows updated, unmatched rows inserted.
 
 ### Incremental Filter
 
@@ -210,8 +211,6 @@ WHERE _ingested_at > (
 {% endif %}
 ```
 
-Only rows with `_ingested_at` newer than the last processed are considered.
-
 ### Deduplication
 
 ```sql
@@ -221,9 +220,7 @@ QUALIFY ROW_NUMBER() OVER (
 ) = 1
 ```
 
-If the same key appears multiple times in Bronze, only the latest record is kept.
-
-### `slv_dim_diagnosis`
+### `dim_diagnosis`
 
 ```sql
 {{ config(
@@ -245,7 +242,7 @@ WHERE _ingested_at > (
 QUALIFY ROW_NUMBER() OVER (PARTITION BY diagnosis_code ORDER BY _ingested_at DESC) = 1
 ```
 
-### `slv_dim_hospital`
+### `dim_hospital`
 
 ```sql
 {{ config(
@@ -269,7 +266,7 @@ WHERE _ingested_at > (
 QUALIFY ROW_NUMBER() OVER (PARTITION BY hospital_id ORDER BY _ingested_at DESC) = 1
 ```
 
-### `slv_dim_patient`
+### `dim_patient`
 
 PII is masked: `first_name` and `last_name` are concatenated and hashed with SHA-256.
 
@@ -298,9 +295,9 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY patient_id ORDER BY _ingested_at DESC) =
 
 **Note:** `first_name` and `last_name` are NOT selected — they are replaced by `patient_first_last_name_masked`.
 
-### `slv_fact_visit`
+### `fact_visit`
 
-Joins `visit` with the 3 dimensions. Only masked patient name is exposed.
+Joins `visit` with the 3 dimensions.
 
 ```sql
 {{ config(
@@ -320,9 +317,9 @@ WITH
         {% endif %}
         QUALIFY ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY _ingested_at DESC) = 1
     ),
-    patient   AS (SELECT * FROM {{ ref('slv_dim_patient') }}),
-    hospital  AS (SELECT * FROM {{ ref('slv_dim_hospital') }}),
-    diagnosis AS (SELECT * FROM {{ ref('slv_dim_diagnosis') }})
+    patient   AS (SELECT * FROM {{ ref('dim_patient') }}),
+    hospital  AS (SELECT * FROM {{ ref('dim_hospital') }}),
+    diagnosis AS (SELECT * FROM {{ ref('dim_diagnosis') }})
 
 SELECT
     v.visit_id,
@@ -353,7 +350,107 @@ LEFT JOIN diagnosis d ON v.diagnosis_code = d.diagnosis_code
 
 ---
 
-## 5. Architecture Summary
+## 5. Gold Layer: Hospital Disease KPI
+
+The Gold layer (`z_dbt_hospital.gold`) contains one KPI table: `hospital_disease_kpi`.
+
+### Model: `hospital_disease_kpi`
+
+Built from `fact_visit`. Computes a **30-day readmission rate** per hospital and diagnosis.
+
+### Readmission Logic
+
+A readmission is defined as a patient being admitted **within 30 days of a previous discharge** for the same diagnosis (CMS / Medicare standard).
+
+Implementation:
+1. For each patient (ordered by `admission_date`), use `LAG(discharge_date)` to get the previous discharge date.
+2. Compute `days_since_last_visit = DATEDIFF(admission_date, previous_discharge)`.
+3. Flag `is_readmission_30d = 1` when `days_since_last_visit <= 30`, otherwise `0`.
+
+### Model Code
+
+```sql
+{{ config(materialized='table') }}
+
+WITH visit_with_prev AS (
+    SELECT
+        visit_id,
+        patient_id,
+        hospital_id,
+        admission_date,
+        discharge_date,
+        LAG(discharge_date) OVER (
+            PARTITION BY patient_id
+            ORDER BY admission_date
+        ) AS previous_discharge,
+        diagnosis_code,
+        cost,
+        _ingested_at,
+        patient_first_last_name_masked,
+        patient_city,
+        gender,
+        dob,
+        first_name,
+        last_name,
+        hospital_name,
+        hospital_city,
+        bed_count,
+        diagnosis_desc,
+        silver_load_timestamp
+    FROM {{ ref('fact_visit') }}
+),
+
+visit_flagged AS (
+    SELECT
+        *,
+        DATEDIFF(admission_date, previous_discharge) AS days_since_last_visit,
+        CASE
+            WHEN DATEDIFF(admission_date, previous_discharge) <= 30 THEN 1
+            ELSE 0
+        END AS is_readmission_30d
+    FROM visit_with_prev
+)
+
+SELECT
+    hospital_id,
+    hospital_name,
+    diagnosis_desc,
+    COUNT(*) AS total_visits,
+    SUM(is_readmission_30d) AS total_readmissions,
+    ROUND(SUM(is_readmission_30d) * 1.0 / COUNT(*), 3) AS readmission_rate,
+    SUM(cost) AS total_cost,
+    AVG(cost) AS avg_cost,
+    CURRENT_TIMESTAMP() AS gold_load_timestamp
+FROM visit_flagged
+GROUP BY hospital_id, hospital_name, diagnosis_desc
+```
+
+### Output Schema
+
+| Column | Description |
+| :--- | :--- |
+| `hospital_id` | Hospital identifier |
+| `hospital_name` | Hospital name |
+| `diagnosis_desc` | Diagnosis description |
+| `total_visits` | Number of visits for this (hospital, diagnosis) pair |
+| `total_readmissions` | Visits flagged as 30-day readmissions |
+| `readmission_rate` | `total_readmissions / total_visits` |
+| `total_cost` | Sum of costs |
+| `avg_cost` | Average cost per visit |
+| `gold_load_timestamp` | Gold table generation time |
+
+### BI Questions Answered
+
+| # | Question | Query |
+| :--- | :--- | :--- |
+| 1 | Which hospital has the highest readmission rate? | `SELECT hospital_name, readmission_rate FROM hospital_disease_kpi ORDER BY readmission_rate DESC` |
+| 2 | Which disease causes the most readmissions? | `SELECT diagnosis_desc, SUM(total_readmissions) FROM hospital_disease_kpi GROUP BY diagnosis_desc ORDER BY 2 DESC` |
+| 3 | Which hospital performs worst for a given disease? | `SELECT * FROM hospital_disease_kpi WHERE diagnosis_desc = '<disease>' ORDER BY readmission_rate DESC` |
+| 4 | Which hospital spends the most? | `SELECT hospital_name, diagnosis_desc, total_cost FROM hospital_disease_kpi ORDER BY total_cost DESC` |
+
+---
+
+## 6. Architecture Summary
 
 ```
 Volume: /Volumes/z_dbt_hospital/source/raw_data_source/
@@ -363,86 +460,81 @@ Volume: /Volumes/z_dbt_hospital/source/raw_data_source/
 Schema: z_dbt_hospital.source      ← raw data, all string, has _ingested_at
     │
     │ dbt Bronze (brz_*)
-    │ - Drop _rescued_data
-    │ - Cast types (dates, numbers)
     ▼
 Schema: z_dbt_hospital.bronze      ← typed raw data
     │
-    │ dbt Silver (slv_*)
-    │ - incremental + merge (SCD1)
-    │ - dedupe with ROW_NUMBER
-    │ - PII masking (SHA-256)
-    │ - dimensional joins
+    │ dbt Silver (dim_*, fact_*)
     ▼
 Schema: z_dbt_hospital.silver      ← 3 dims + 1 fact
-    ├── slv_dim_diagnosis
-    ├── slv_dim_hospital
-    ├── slv_dim_patient
-    └── slv_fact_visit
+    ├── dim_diagnosis
+    ├── dim_hospital
+    ├── dim_patient
+    └── fact_visit
+    │
+    │ dbt Gold (hospital_disease_kpi)
+    ▼
+Schema: z_dbt_hospital.gold        ← KPI table
+    └── hospital_disease_kpi
 ```
 
 ---
 
-## 6. Key Design Decisions
+## 7. Key Design Decisions
 
 | Decision | Rationale |
 | :--- | :--- |
 | **Auto Loader writes to `source`, not `bronze`** | Keeps "raw ingestion" separate from "typed/amended data" |
-| **`_ingested_at` added at Bronze write time** | Provides an audit column and deduplication ordering key |
-| **`_rescued_data` dropped** | It's an Auto Loader fault-tolerance column with no business value |
-| **IDs remain `STRING`** | They contain prefixes (V/P/H/D), not pure numbers |
-| **dbt Bronze = type casting only** | Separation of concerns: Bronze amends, Silver models |
-| **Silver uses SCD1 (merge)** | Historical tracking is not required for this dataset |
-| **`incremental_strategy='merge'`** | This is what makes it SCD1, not append |
-| **Patient name is hashed with SHA-256** | PII protection |
+| **`_ingested_at` added at Bronze write time** | Audit column + deduplication ordering key |
+| **`_rescued_data` dropped** | Auto Loader fault-tolerance column, no business value |
+| **IDs remain `STRING`** | Contain prefixes (V/P/H/D), not pure numbers |
+| **dbt Bronze = type casting only** | Separation of concerns |
+| **Silver uses SCD1 (merge)** | No history required for this dataset |
+| **`incremental_strategy='merge'`** | Makes it SCD1, not append |
+| **Patient name hashed with SHA-256** | PII protection |
+| **Gold uses LAG + DATEDIFF** | CMS-standard 30-day readmission window |
 
 ---
 
-## 7. Differences from the Reference Implementation
+## 8. Differences from the Reference Implementation
 
-This project follows the same Medallion architecture as the reference tutorial (Databricks notebooks + MERGE), but applies **dbt** for the transformation layer and makes a few deliberate improvements.
+This project follows the same Medallion architecture as the reference tutorial (Databricks notebooks + MERGE), but applies **dbt** for the transformation layer.
 
-### 7.1 Transformation Tool: dbt instead of Databricks Notebooks
+### 8.1 Transformation Tool: dbt instead of Databricks Notebooks
 
-| Aspect | Reference (Databricks Notebooks) | This Project (dbt) |
+| Aspect | Reference | This Project |
 | :--- | :--- | :--- |
 | **Transform language** | PySpark + DeltaTable.merge() | SQL + dbt incremental models |
 | **Version control** | Notebook (JSON) | Plain `.sql` files (Git-friendly) |
-| **Testing** | Manual / ad-hoc | `dbt test` (built-in) |
-| **Docs** | Manual | `dbt docs generate` (auto-generated) |
-| **Dependency management** | Manual (`spark.read.table(...)`) | Automatic (`{{ ref(...) }}`) |
+| **Testing** | Manual | `dbt test` (built-in) |
+| **Docs** | Manual | `dbt docs generate` |
+| **Dependency management** | Manual | Automatic (`{{ ref(...) }}`) |
 | **Incremental logic** | `foreachBatch` + checkpoint | `incremental_strategy='merge'` |
 
-### 7.2 SCD1 Implementation: MERGE Strategy
-
-Both implementations use **SCD1** (last-write-wins):
+### 8.2 SCD1 Implementation
 
 | Aspect | Reference | This Project |
 | :--- | :--- | :--- |
 | **Dedup method** | `dropDuplicates([key])` | `ROW_NUMBER() OVER (PARTITION BY key ORDER BY _ingested_at DESC) = 1` |
-| **Upsert method** | `DeltaTable.merge(...).whenMatchedUpdateAll().whenNotMatchedInsertAll()` | dbt `incremental_strategy='merge'` |
+| **Upsert method** | `DeltaTable.merge(...)` | dbt `incremental_strategy='merge'` |
 | **Incremental trigger** | `readStream` (streaming) | `{% if is_incremental() %}` (batch) |
 
-### 7.3 Improvement: Fact Table Deduplication
+### 8.3 Improvement: Fact Table Deduplication
 
-**Reference implementation:** `fact_visit` is built by joining `visit` with the 3 dimensions, then MERGEd into the target. **No explicit deduplication** is performed on `visit_id`.
+**Reference:** `fact_visit` is built by joining `visit` with the 3 dimensions, then MERGEd. **No explicit deduplication** on `visit_id`.
 
-**This project:** an explicit deduplication step is added:
+**This project:** adds:
 
 ```sql
 QUALIFY ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY _ingested_at DESC) = 1
 ```
 
-**Why this matters:**
-- If Auto Loader re-runs (e.g., checkpoint reset), the Bronze `visit_raw` table may contain duplicate `visit_id` rows.
-- Without deduplication, the Silver `fact_visit` table would contain duplicates.
-- The reference implementation implicitly assumes the source is clean; this project defends against it.
+**Why:** if Auto Loader re-runs, `brz_visit` may contain duplicate `visit_id`. Without dedup, `fact_visit` would have duplicates.
 
-**Conclusion:** The reference implementation is **pedagogically simplified** (small, clean dataset). This project adopts a **production-oriented** approach by adding deduplication even on the fact table.
+**Conclusion:** the reference is **pedagogically simplified**. This project adopts a **production-oriented** approach.
 
 ---
 
-## 8. Tools Used
+## 9. Tools Used
 
 | Tool | Purpose |
 | :--- | :--- |
@@ -454,7 +546,7 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY _ingested_at DESC) = 1
 
 ---
 
-## 9. How to Run
+## 10. How to Run
 
 ```bash
 # 1. Ingest raw CSVs into `source` schema
@@ -466,10 +558,13 @@ dbt run --select bronze
 # 3. Run dbt Silver models
 dbt run --select silver
 
-# 4. Test
+# 4. Run dbt Gold models
+dbt run --select gold
+
+# 5. Test
 dbt test
 
-# 5. Generate docs
+# 6. Generate docs
 dbt docs generate
 dbt docs serve
 ```
@@ -477,7 +572,5 @@ dbt docs serve
 ---
 
 ## Reference Tutorial
-
-This project is based on / inspired by the following YouTube tutorial:
 
 - [Healthcare End-to-End Data Engineering Project](https://www.youtube.com/watch?v=sNCaDZZZmAs&t=6186s)

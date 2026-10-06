@@ -522,6 +522,118 @@ This project follows the same Medallion architecture as the reference tutorial (
 >
 > Reference: [Databricks docs — Upsert into a Delta Lake table using merge](https://docs.databricks.com/aws/en/delta/merge)
 
+#### Why SCD1 and not SCD2?
+
+The reference implementation (and this project) uses **SCD1** — only the latest state per key is kept. This is sufficient for this dataset because:
+
+- Visit, patient, hospital, and diagnosis records are effectively **immutable** (they don't change after creation).
+- Historical tracking is not a business requirement here.
+- SCD1 is simpler and cheaper.
+
+**If SCD2 were needed** (e.g., patients' addresses change over time), the merge logic would need to change:
+
+```python
+# 1. Instead of UpdateAll, mark the old version as expired
+.whenMatchedUpdate(set = {
+    "is_current": "false",
+    "__END_AT":   "current_timestamp()"
+})
+
+# 2. Then INSERT a new version (with __START_AT = now, is_current = true)
+```
+
+Or in DLT (Lakeflow Pipelines), this is handled declaratively:
+
+```python
+dp.create_auto_cdc_flow(
+    target = "silver.dim_patient",
+    source = "bronze.patient_raw",
+    keys = ["patient_id"],
+    sequence_by = col("updated_at"),
+    stored_as_scd_type = 2     # ← SCD2
+)
+```
+
+**Note:** SCD2 requires the source to provide a reliable "sequence column" (e.g., `updated_at`). In this dataset, no such column exists, so SCD1 is the natural choice.
+
+#### SCD2 in dbt: `dbt snapshot`
+
+dbt has **native SCD2 support** via `dbt snapshot`. Instead of writing custom merge logic, you declare the snapshot config and dbt maintains the history automatically.
+
+There are two `strategy` options:
+
+| Strategy | Requires | How it detects changes |
+| :--- | :--- | :--- |
+| `timestamp` | An `updated_at` column | Row changed if `updated_at` is newer |
+| **`check`** | No timestamp needed | Row changed if any of the checked columns changed |
+
+Since this dataset has **no `updated_at` column**, `strategy='check'` would be used.
+
+**Snapshot definition** (`snapshots/dim_patient_snapshot.sql`):
+
+```sql
+{% snapshot dim_patient_snapshot %}
+
+{{
+    config(
+      target_schema='snapshots',
+      unique_key='patient_id',
+      strategy='check',
+      check_cols=['city', 'gender', 'dob']
+    )
+}}
+
+SELECT
+    patient_id,
+    first_name,
+    last_name,
+    gender,
+    dob,
+    city
+FROM {{ source('hospital_source', 'patient') }}
+
+{% endsnapshot %}
+```
+
+**Run it:**
+
+```bash
+dbt snapshot
+```
+
+**Config breakdown:**
+
+| Key | Value | Purpose |
+| :--- | :--- | :--- |
+| `unique_key` | `patient_id` | Business key to track |
+| `strategy` | `check` | Detect changes by comparing column values |
+| `check_cols` | `['city', 'gender', 'dob']` | Columns to monitor for changes |
+| `target_schema` | `snapshots` | Where the snapshot table lives |
+
+**What dbt does automatically:**
+
+| Column | Purpose |
+| :--- | :--- |
+| `dbt_scd_id` | Surrogate key for each version |
+| `dbt_updated_at` | When the snapshot row was last captured |
+| `dbt_valid_from` | When this version became active |
+| `dbt_valid_to` | When this version was superseded (NULL = current) |
+
+On each `dbt snapshot` run:
+1. **New rows** → inserted with `dbt_valid_to = NULL`.
+2. **Changed rows** (any `check_cols` value differs) → old version closed (`dbt_valid_to = now`), new version inserted with `dbt_valid_from = now`.
+3. **Unchanged rows** → left as is.
+4. Rows with `dbt_valid_to IS NULL` are the **current version**.
+
+**Why `strategy='check'` and not `timestamp`?**
+- The source (`patient`) has no `updated_at` column.
+- `strategy='check'` works by comparing column values between runs — no timestamp needed.
+
+**Why this project uses SCD1 instead:**
+- No business need for historical tracking.
+- SCD1 (merge) is simpler and cheaper.
+- SCD2 (snapshot) is shown here as a reference for future extensions.
+
 ### 8.3 Improvement: Fact Table Deduplication
 
 **Reference:** `fact_visit` is built by joining `visit` with the 3 dimensions, then MERGEd. **No explicit deduplication** on `visit_id`.

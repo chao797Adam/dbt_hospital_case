@@ -352,9 +352,9 @@ LEFT JOIN diagnosis d ON v.diagnosis_code = d.diagnosis_code
 
 ## 5. Gold Layer: Hospital Disease KPI
 
-The Gold layer (`z_dbt_hospital.gold`) contains one KPI table: `hospital_disease_kpi`.
+The Gold layer (`z_dbt_hospital.gold`) contains one KPI table: `gold_hospital_disease_kpi`.
 
-### Model: `hospital_disease_kpi`
+### Model: `gold_hospital_disease_kpi`
 
 Built from `fact_visit`. Computes a **30-day readmission rate** per hospital and diagnosis.
 
@@ -443,10 +443,95 @@ GROUP BY hospital_id, hospital_name, diagnosis_desc
 
 | # | Question | Query |
 | :--- | :--- | :--- |
-| 1 | Which hospital has the highest readmission rate? | `SELECT hospital_name, readmission_rate FROM hospital_disease_kpi ORDER BY readmission_rate DESC` |
-| 2 | Which disease causes the most readmissions? | `SELECT diagnosis_desc, SUM(total_readmissions) FROM hospital_disease_kpi GROUP BY diagnosis_desc ORDER BY 2 DESC` |
-| 3 | Which hospital performs worst for a given disease? | `SELECT * FROM hospital_disease_kpi WHERE diagnosis_desc = '<disease>' ORDER BY readmission_rate DESC` |
-| 4 | Which hospital spends the most? | `SELECT hospital_name, diagnosis_desc, total_cost FROM hospital_disease_kpi ORDER BY total_cost DESC` |
+| 1 | Which hospital has the highest readmission rate? | `SELECT hospital_name, readmission_rate FROM ... ORDER BY readmission_rate DESC` |
+| 2 | Which disease causes the most readmissions? | `SELECT diagnosis_desc, SUM(total_readmissions) FROM ... GROUP BY diagnosis_desc ORDER BY 2 DESC` |
+| 3 | Which hospital performs worst for a given disease? | `SELECT * FROM ... WHERE diagnosis_desc = '<disease>' ORDER BY readmission_rate DESC` |
+| 4 | Which hospital spends the most? | `SELECT hospital_name, diagnosis_desc, total_cost FROM ... ORDER BY total_cost DESC` |
+
+### Sample Queries & Results
+
+Below are the four BI queries run against `gold_hospital_disease_kpi`.
+
+**Note:** The reference tutorial uses a `diagnosis_category` column (e.g., `'Cardiology'`) which is not present in this dataset. Queries here use `diagnosis_desc` instead (e.g., `'Hypertension'`).
+
+#### Q1: Which hospital has the highest readmission rate?
+
+```sql
+SELECT
+    hospital_name,
+    readmission_rate
+FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+ORDER BY readmission_rate DESC;
+```
+
+**Sample result:**
+
+| hospital_name | readmission_rate |
+| :--- | :--- |
+| Manipal Hospital | 0.5 |
+| Kokilaben Dhirubhai Hospital | 0.5 |
+| Yashoda Hospital | 0 |
+| Apollo Main Hospital | 0 |
+| Fortis Healthcare Delhi | 0 |
+
+**Insight:** Manipal Hospital and Kokilaben Dhirubhai Hospital share the highest readmission rate (0.5). The other three hospitals have no readmissions in this dataset.
+
+#### Q2: Which disease causes the most readmissions?
+
+```sql
+SELECT
+    diagnosis_desc,
+    SUM(total_readmissions) AS total_readm
+FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+GROUP BY diagnosis_desc
+ORDER BY total_readm DESC;
+```
+
+**Sample result:**
+
+| diagnosis_desc | total_readm |
+| :--- | :--- |
+| Chest Pain | 1 |
+| Kidney Infection | 1 |
+| Diabetes Type 2 | 0 |
+| Asthma | 0 |
+| Hypertension | 0 |
+
+**Insight:** Chest Pain and Kidney Infection each have 1 readmission. The other three diseases have 0 readmissions in this dataset.
+
+#### Q3: Which hospital performs worst for a given disease?
+
+Uses `Chest Pain` as an example.
+
+```sql
+SELECT *
+FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+WHERE diagnosis_desc = 'Chest Pain'
+ORDER BY readmission_rate DESC;
+```
+
+#### Q4: Which hospital spends the most?
+
+```sql
+SELECT
+    hospital_name,
+    diagnosis_desc,
+    total_cost
+FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+ORDER BY total_cost DESC;
+```
+
+**Sample result:**
+
+| hospital_name | diagnosis_desc | total_cost |
+| :--- | :--- | :--- |
+| Manipal Hospital | Kidney Infection | 38000 |
+| Fortis Healthcare Delhi | Hypertension | 35000 |
+| Kokilaben Dhirubhai Hospital | Chest Pain | 21000 |
+| Apollo Main Hospital | Diabetes Type 2 | 20000 |
+| Yashoda Hospital | Asthma | 14000 |
+
+**Insight:** Manipal Hospital has the highest total cost for a single (hospital, disease) pair — 38000 for Kidney Infection.
 
 ---
 
@@ -471,10 +556,10 @@ Schema: z_dbt_hospital.silver      ← 3 dims + 1 fact
     ├── dim_patient
     └── fact_visit
     │
-    │ dbt Gold (hospital_disease_kpi)
+    │ dbt Gold (gold_hospital_disease_kpi)
     ▼
 Schema: z_dbt_hospital.gold        ← KPI table
-    └── hospital_disease_kpi
+    └── gold_hospital_disease_kpi
 ```
 
 ---

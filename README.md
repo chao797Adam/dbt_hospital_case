@@ -518,6 +518,10 @@ This project follows the same Medallion architecture as the reference tutorial (
 | **Upsert method** | `DeltaTable.merge(...)` | dbt `incremental_strategy='merge'` |
 | **Incremental trigger** | `readStream` (streaming) | `{% if is_incremental() %}` (batch) |
 
+> **Under the hood:** dbt's `incremental_strategy='merge'` compiles to a Delta Lake `MERGE INTO` statement — the same primitive used in the reference implementation (via `DeltaTable.merge()`). The difference is that dbt *declares* this behavior once via config, rather than writing the merge logic imperatively per model.
+>
+> Reference: [Databricks docs — Upsert into a Delta Lake table using merge](https://docs.databricks.com/aws/en/delta/merge)
+
 ### 8.3 Improvement: Fact Table Deduplication
 
 **Reference:** `fact_visit` is built by joining `visit` with the 3 dimensions, then MERGEd. **No explicit deduplication** on `visit_id`.

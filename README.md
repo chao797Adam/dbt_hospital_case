@@ -759,8 +759,6 @@ dbt test
 
 **Both approaches are valid.** Asset Bundle is suitable for teams managing many Notebook-based Jobs. dbt is suitable for SQL-heavy transformations with built-in lineage and testing.
 
----
-
 ## 9. Tools Used
 
 | Tool | Purpose |
@@ -770,8 +768,6 @@ dbt test
 | **Delta Lake** | Storage format |
 | **dbt (dbt-databricks)** | SQL transformations, SCD1, tests, docs |
 | **Databricks SQL Warehouse** | Query engine for dbt |
-
----
 
 ## 10. How to Run
 
@@ -795,8 +791,6 @@ dbt test
 dbt docs generate
 dbt docs serve
 ```
-
----
 
 ## Reference Tutorial
 

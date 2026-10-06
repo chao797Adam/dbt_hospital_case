@@ -11,6 +11,23 @@ The pipeline:
 
 ---
 
+## Business Context
+
+**Organization:** ApexLife Hospitals — a multi-hospital network across several cities, serving thousands of patients every month.
+
+**Problem:** The network has observed a growing issue of patients being **readmitted within 30 days of discharge**. These readmissions create multiple challenges:
+
+1. **Financial Impact**
+   Many readmissions are not reimbursed, or result in reduced payment, because insurers and government schemes treat them as **treatment failure**.
+
+2. **Operational Pressure**
+   Readmissions reduce bed availability for new patients.
+
+3. **Patient Outcomes & Experience**
+   High readmission rates impact patient trust in the hospital.
+
+**Goal of this project:** Build an end-to-end data pipeline that identifies **30-day readmissions** across hospitals and diagnoses, so that the hospital network can monitor and reduce them.
+
 ## 1. Data Sources
 
 Four CSVs are stored in a Databricks Volume:
@@ -929,6 +946,21 @@ Four questions were asked via Genie. The captured results are stored in the `ass
 
 - Genie auto-generates SQL from natural language, lowering the barrier for business users.
 - Q3 and Q4 require the Silver `fact_visit` table (date columns), not just the Gold KPI table.
+
+## 13. Dashboard
+
+A Databricks Dashboard was built on top of `gold_hospital_disease_kpi` with four visualizations:
+
+| # | Visualization | Chart Type |
+| :--- | :--- | :--- |
+| 1 | Total visits per hospital | Bar chart |
+| 2 | Total readmissions per hospital (by diagnosis) | Bar chart |
+| 3 | Readmission rate per hospital | Bar chart |
+| 4 | Total cost per hospital (by diagnosis) | Bar chart |
+
+The dashboard is stored in the Databricks Workspace and is scheduled to send daily email snapshots.
+
+Snapshot: `assets/dashboard.png`.
 
 ## Reference Tutorial
 

@@ -556,6 +556,10 @@ dp.create_auto_cdc_flow(
 
 **Note:** SCD2 requires the source to provide a reliable "sequence column" (e.g., `updated_at`). In this dataset, no such column exists, so SCD1 is the natural choice.
 
+**Note on dim vs. fact:**
+- **Dimension tables** (`dim_patient`, `dim_hospital`, `dim_diagnosis`) — SCD2 is often a good fit, because dimension attributes change over time (address, bed count). This project uses SCD1 for simplicity; SCD2 would be a natural extension.
+- **Fact tables** (`fact_visit`) — SCD1 (or even `append`) is typically preferred, because fact events are immutable. Historical fact versions are usually not needed.
+
 #### SCD2 in dbt: `dbt snapshot`
 
 dbt has **native SCD2 support** via `dbt snapshot`. Instead of writing custom merge logic, you declare the snapshot config and dbt maintains the history automatically.

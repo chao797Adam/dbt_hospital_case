@@ -916,21 +916,14 @@ The Gold table `gold_hospital_disease_kpi` and the Silver table `fact_visit` are
 
 ### Questions & Results
 
-#### Q1: Which hospitals have a readmission rate above 20%?
+Four questions were asked via Genie. The captured results are stored in the `assets/` folder:
 
-![Two Hospitals Above 20%](./assets/Two%20Hospitals%20Have%20Readmi.pdf)
-
-#### Q2: What is the average length of stay?
-
-![Average Length of Stay](./assets/Average%20Length%20of%20Stay_4.pdf)
-
-#### Q3: Which patient had the longest stay and then was readmitted?
-
-![Longest Stay + Readmitted](./assets/Kabir%20Menon%20Had%20the%20Longe.pdf)
-
-#### Q4: Are we improving monthly based on readmission rate?
-
-![Month-over-Month Improvement](./assets/Currently%20Improving_Apri.pdf)
+| # | Question | Result file |
+| :--- | :--- | :--- |
+| Q1 | Which hospitals have a readmission rate above 20%? | `assets/Two Hospitals Have Readmi.pdf` |
+| Q2 | What is the average length of stay? | `assets/Average Length of Stay_4.pdf` |
+| Q3 | Which patient had the longest stay and then was readmitted? | `assets/Kabir Menon Had the Longe.pdf` |
+| Q4 | Are we improving monthly based on readmission rate? | `assets/Currently Improving_Apri.pdf` |
 
 ### Notes
 

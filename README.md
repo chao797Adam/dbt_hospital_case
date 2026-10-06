@@ -737,6 +737,28 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY _ingested_at DESC) = 1
 
 **Conclusion:** the reference is **pedagogically simplified**. This project adopts a **production-oriented** approach.
 
+### 8.4 Job Orchestration: dbt run vs. Asset Bundle
+
+The reference implementation uses **Databricks Asset Bundle** (`reference_bundle_job_file.yml`) to define an end-to-end Job with 8 Notebook tasks and `depends_on` dependencies.
+
+This project uses **`dbt run`** as the orchestration layer:
+
+```bash
+dbt run --select bronze
+dbt run --select silver
+dbt run --select gold
+dbt test
+```
+
+| Aspect | Reference (Asset Bundle) | This Project (dbt run) |
+| :--- | :--- | :--- |
+| **Definition** | YAML (`reference_bundle_job_file.yml`) | CLI commands |
+| **Dependencies** | `depends_on` in YAML | Implicit in `{{ ref() }}` DAG |
+| **Deployment** | `databricks bundle deploy` | `git push` + CI/CD |
+| **Testing** | Separate Notebook | `dbt test` (built-in) |
+
+**Both approaches are valid.** Asset Bundle is suitable for teams managing many Notebook-based Jobs. dbt is suitable for SQL-heavy transformations with built-in lineage and testing.
+
 ---
 
 ## 9. Tools Used

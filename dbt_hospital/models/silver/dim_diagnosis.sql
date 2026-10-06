@@ -14,7 +14,7 @@ from {{ ref('brz_diagnosis') }}
 {% if is_incremental() %}
     where
         _ingested_at
-        > (select coalesce(max(load_timestamp), '1900-01-01') from {{ this }})
+        > (select coalesce(max(_ingested_at), '1900-01-01') from {{ this }})
 {% endif %}
 
 qualify row_number() over (partition by diagnosis_code order by _ingested_at desc) = 1

@@ -2,7 +2,7 @@ version: 2
 
 sources:
   - name: hospital_source
-    catalog: z_dbt_hospital
+    catalog: "{{ target.catalog }}"
     schema: source
     tables:
       - name: diagnosis

@@ -910,6 +910,33 @@ dbt test --target prod
 dbt run --target prod --full-refresh
 ```
 
+## 12. Genie: Natural Language BI
+
+The Gold table `gold_hospital_disease_kpi` and the Silver table `fact_visit` are exposed to **Databricks Genie** for natural-language BI.
+
+### Questions & Results
+
+#### Q1: Which hospitals have a readmission rate above 20%?
+
+![Two Hospitals Above 20%](./assets/Two%20Hospitals%20Have%20Readmi.pdf)
+
+#### Q2: What is the average length of stay?
+
+![Average Length of Stay](./assets/Average%20Length%20of%20Stay_4.pdf)
+
+#### Q3: Which patient had the longest stay and then was readmitted?
+
+![Longest Stay + Readmitted](./assets/Kabir%20Menon%20Had%20the%20Longe.pdf)
+
+#### Q4: Are we improving monthly based on readmission rate?
+
+![Month-over-Month Improvement](./assets/Currently%20Improving_Apri.pdf)
+
+### Notes
+
+- Genie auto-generates SQL from natural language, lowering the barrier for business users.
+- Q3 and Q4 require the Silver `fact_visit` table (date columns), not just the Gold KPI table.
+
 ## Reference Tutorial
 
 - [Healthcare End-to-End Data Engineering Project](https://www.youtube.com/watch?v=sNCaDZZZmAs&t=6186s)

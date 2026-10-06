@@ -792,6 +792,124 @@ dbt docs generate
 dbt docs serve
 ```
 
+## 11. Deployment
+
+### 11.1 Multi-Environment Setup
+
+The project uses **two catalogs** for isolation:
+
+| Environment | Catalog | Purpose |
+| :--- | :--- | :--- |
+| **dev** | `z_dbt_hospital` | Development, ad-hoc runs |
+| **prod** | `z_dbt_hospital_prod` | Scheduled / production runs |
+
+Both targets are defined in `profiles.yml`:
+
+```yaml
+dbt_hospital:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      catalog: z_dbt_hospital
+      schema: default
+      ...
+    prod:
+      type: databricks
+      catalog: z_dbt_hospital_prod
+      schema: default
+      ...
+```
+
+Run against a target:
+
+```bash
+dbt run --target dev
+dbt run --target prod
+```
+
+### 11.2 Source Tables in prod
+
+Since dbt's `source` tables are created by **Auto Loader** (not by dbt), the `prod` catalog requires its own `source` schema. For a one-time migration, CTAS was used:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS z_dbt_hospital_prod.source;
+
+CREATE TABLE z_dbt_hospital_prod.source.diagnosis AS SELECT * FROM z_dbt_hospital.source.diagnosis;
+CREATE TABLE z_dbt_hospital_prod.source.hospital  AS SELECT * FROM z_dbt_hospital.source.hospital;
+CREATE TABLE z_dbt_hospital_prod.source.patient   AS SELECT * FROM z_dbt_hospital.source.patient;
+CREATE TABLE z_dbt_hospital_prod.source.visit     AS SELECT * FROM z_dbt_hospital.source.visit;
+```
+
+> **Note:** For a production-grade setup, Auto Loader should be parameterized to write to `{catalog}.source.*` and run separately per environment. CTAS is a one-time shortcut for demonstration.
+
+### 11.3 Environment Isolation Test
+
+To verify that `dev` and `prod` are truly isolated, a test row was inserted only into `prod`:
+
+```sql
+INSERT INTO z_dbt_hospital_prod.source.diagnosis
+VALUES ('D999', 'Test Disease', CURRENT_TIMESTAMP());
+```
+
+Then `dim_diagnosis` was rebuilt in `prod`:
+
+```bash
+dbt run --target prod --select +dim_diagnosis
+```
+
+**Verification:**
+
+```sql
+-- prod: contains the test row
+SELECT * FROM z_dbt_hospital_prod.bronze.brz_diagnosis WHERE diagnosis_code = 'D999';
+-- → 1 row
+
+-- dev: does not contain the test row
+SELECT * FROM z_dbt_hospital.bronze.brz_diagnosis WHERE diagnosis_code = 'D999';
+-- → 0 rows
+```
+
+**Conclusion:** The two catalogs are physically isolated. Running `dbt run --target prod` only affects `z_dbt_hospital_prod`, and `dbt run --target dev` only affects `z_dbt_hospital`.
+
+### 11.4 `sources.yml` Uses `target.catalog`
+
+To ensure dbt reads from the correct catalog per environment, `sources.yml` uses a Jinja variable:
+
+```yaml
+version: 2
+
+sources:
+  - name: hospital_source
+    catalog: "{{ target.catalog }}"
+    schema: source
+    tables:
+      - name: diagnosis
+      - name: hospital
+      - name: patient
+      - name: visit
+```
+
+| Target | `target.catalog` | Reads from |
+| :--- | :--- | :--- |
+| `dev` | `z_dbt_hospital` | `z_dbt_hospital.source.*` |
+| `prod` | `z_dbt_hospital_prod` | `z_dbt_hospital_prod.source.*` |
+
+### 11.5 Deployment Commands
+
+```bash
+# Deploy to dev
+dbt run --target dev
+dbt test --target dev
+
+# Deploy to prod
+dbt run  --target prod
+dbt test --target prod
+
+# Full refresh (first prod run)
+dbt run --target prod --full-refresh
+```
+
 ## Reference Tutorial
 
 - [Healthcare End-to-End Data Engineering Project](https://www.youtube.com/watch?v=sNCaDZZZmAs&t=6186s)

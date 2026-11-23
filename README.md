@@ -198,6 +198,73 @@ sources:
       - name: visit
 ```
 
+### Bronze Layer Validation — Dynamic Table Inspection
+
+A reusable PySpark utility is used to dynamically discover and inspect all tables within a given catalog and schema, without manually specifying table names.
+
+```python
+catalog = "z_dbt_hospital"
+schema = "bronze"
+
+tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
+
+for table in tables:
+    full_name = f"{catalog}.{schema}.{table.tableName}"
+    df = spark.table(full_name)
+
+    print("=" * 80)
+    print(f"Table: {full_name}")
+    print(f"Row Count: {df.count()}")
+    print("=" * 80)
+
+    df.printSchema()
+    display(df)
+```
+
+#### Validation Objectives
+
+| Validation | Purpose |
+| :--- | :--- |
+| Dynamic Table Discovery | Automatically discovers tables without hardcoded table names |
+| Row Count | Supports row count reconciliation between layers |
+| Schema Inspection | Verifies data types after Bronze transformations |
+| Data Preview | Supports manual inspection of transformed records |
+| Reusability | Works across different catalogs, schemas and projects |
+
+#### Cross-Layer Reusability
+
+The same utility can be reused by changing the `schema` parameter.
+
+| Schema | Validation Purpose |
+| :--- | :--- |
+| `source` | Raw ingestion inspection |
+| `bronze` | Data type validation |
+| `silver` | Dimensional model inspection |
+| `gold` | Business KPI inspection |
+| `snapshots` | SCD2 historical version inspection |
+
+The `catalog` parameter can also be changed between development and production environments.
+
+#### Execution Evidence
+
+The following screenshot demonstrates the dynamic table inspection utility running against the Source layer in Databricks.
+
+![Dynamic Table Inspection](assets/dynamic_table_inspection.png)
+
+The inspection of `source.diagnosis` confirms:
+
+- Row count: 5 records.
+- Raw business columns are stored as STRING.
+- `_ingested_at` is stored as TIMESTAMP.
+- `_rescued_data` is NULL for all five records.
+- Table metadata, schema and data preview are displayed automatically.
+
+The same utility is reused to inspect the Bronze, Silver, Gold and Snapshot layers.
+
+**Design Rationale:** This metadata-driven approach reduces repetitive SQL queries and provides a consistent inspection method across pipeline layers and environments.
+
+**Limitation:** This utility is intended for interactive development and manual inspection. For large production tables, full row counts can be expensive. Data previews should be limited using `display(df.limit(20))`. Automated data quality enforcement is handled separately through dbt tests.
+
 ---
 
 ## 4. Silver Layer: Dimensional Models (SCD1)

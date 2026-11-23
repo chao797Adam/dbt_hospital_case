@@ -249,7 +249,7 @@ The `catalog` parameter can also be changed between development and production e
 
 The following screenshot demonstrates the dynamic table inspection utility running against the Source layer in Databricks.
 
-![Dynamic Table Inspection](../assets/dynamic_table_inspection.png)
+![Dynamic Table Inspection](./assets/dynamic_table_inspection.png)
 
 The inspection of `source.diagnosis` confirms:
 

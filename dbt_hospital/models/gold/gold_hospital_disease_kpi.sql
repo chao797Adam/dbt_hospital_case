@@ -10,7 +10,7 @@ with
             discharge_date,
             lag(discharge_date) over (
                 partition by patient_id order by admission_date
-            ) as previous_discharge,  -- �\udc90 close to discharge_date
+            ) as previous_discharge,
             diagnosis_code,
             cost,
             _ingested_at,

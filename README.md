@@ -7,6 +7,7 @@ The pipeline:
 - Loads them into a `source` schema using **Auto Loader**.
 - Amends schema and data types in a **Bronze** layer (dbt).
 - Builds dimensional models (SCD1) in a **Silver** layer (dbt).
+- Maintains patient attribute history using a **dbt Snapshot (SCD2)** alongside the current-state Silver dimension.
 - Produces a KPI table for 30-day readmission analysis in a **Gold** layer (dbt).
 
 ---
@@ -18,7 +19,7 @@ The pipeline:
 **Problem:** The network has observed a growing issue of patients being **readmitted within 30 days of discharge**. These readmissions create multiple challenges:
 
 1. **Financial Impact**
-   Many readmissions are not reimbursed, or result in reduced payment, because insurers and government schemes treat them as **treatment failure**.
+   Some readmissions may affect reimbursement under applicable payment and quality programs; not every readmission is avoidable or a treatment failure.
 
 2. **Operational Pressure**
    Readmissions reduce bed availability for new patients.
@@ -76,12 +77,12 @@ for s in sources:
         .format("cloudFiles")
         .option("cloudFiles.format", "csv")
         .option("header", "true")
-        .option("inferSchema", "true")
+        .option("cloudFiles.inferColumnTypes", "false")
         .option("cloudFiles.schemaLocation", schema_loc)
         .load(s["src"])
     )
 
-    (df
+    query = (df
         .withColumn("_ingested_at", current_timestamp())
         .writeStream
         .format("delta")
@@ -90,6 +91,7 @@ for s in sources:
         .trigger(availableNow=True)
         .toTable(table_name)
     )
+    query.awaitTermination()
 ```
 
 ### Key Points
@@ -98,11 +100,11 @@ for s in sources:
 | :--- | :--- |
 | `cloudFiles.format = "csv"` | Read CSV |
 | `header = "true"` | Use first row as header |
-| `inferSchema = "true"` | Auto-infer types (mostly string due to CSV quirks) |
+| `cloudFiles.inferColumnTypes = "false"` | Keep CSV fields as strings for explicit downstream casting |
 | `cloudFiles.schemaLocation` | Stores schema evolution history |
 | `checkpointLocation` | Tracks ingestion progress |
 | `trigger(availableNow=True)` | Process once, then stop |
-| `_ingested_at` | Ingestion timestamp (added at Bronze write time) |
+| `_ingested_at` | Ingestion timestamp (added at Source ingestion time) |
 
 ### Resulting Source Tables
 
@@ -187,7 +189,7 @@ version: 2
 
 sources:
   - name: hospital_source
-    catalog: z_dbt_hospital
+    catalog: "{{ target.catalog }}"
     schema: source
     tables:
       - name: diagnosis
@@ -214,7 +216,7 @@ All Silver models use:
 ) }}
 ```
 
-- **`materialized='incremental'`**: Process only new data.
+- **`materialized='incremental'`**: Enables incremental execution; the explicit filter selects incoming rows.
 - **`unique_key`**: Identifies which row is "the same entity".
 - **`incremental_strategy='merge'`**: **SCD1** — matched rows updated, unmatched rows inserted.
 
@@ -285,7 +287,7 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY hospital_id ORDER BY _ingested_at DESC) 
 
 ### `dim_patient`
 
-PII is masked: `first_name` and `last_name` are concatenated and hashed with SHA-256.
+Patient names are pseudonymized: `first_name` and `last_name` are concatenated and hashed with SHA-256.
 
 ```sql
 {{ config(
@@ -377,12 +379,12 @@ Built from `fact_visit`. Computes a **30-day readmission rate** per hospital and
 
 ### Readmission Logic
 
-A readmission is defined as a patient being admitted **within 30 days of a previous discharge** for the same diagnosis (CMS / Medicare standard).
+For this demonstration, a readmission is a visit starting 0–30 days after the immediately preceding visit for the same patient and diagnosis. This is a simplified visit-based indicator, not an official CMS risk-adjusted readmission measure. Cross-hospital readmissions are included and attributed to the receiving hospital.
 
 Implementation:
-1. For each patient (ordered by `admission_date`), use `LAG(discharge_date)` to get the previous discharge date.
+1. For each patient and diagnosis (ordered by `admission_date`, then `visit_id`), use `LAG(discharge_date)` to get the previous discharge date.
 2. Compute `days_since_last_visit = DATEDIFF(admission_date, previous_discharge)`.
-3. Flag `is_readmission_30d = 1` when `days_since_last_visit <= 30`, otherwise `0`.
+3. Flag `is_readmission_30d = 1` when `days_since_last_visit` is between 0 and 30 inclusive, otherwise `0`.
 
 ### Model Code
 
@@ -397,8 +399,8 @@ WITH visit_with_prev AS (
         admission_date,
         discharge_date,
         LAG(discharge_date) OVER (
-            PARTITION BY patient_id
-            ORDER BY admission_date
+            PARTITION BY patient_id, diagnosis_code
+            ORDER BY admission_date, visit_id
         ) AS previous_discharge,
         diagnosis_code,
         cost,
@@ -407,8 +409,6 @@ WITH visit_with_prev AS (
         patient_city,
         gender,
         dob,
-        first_name,
-        last_name,
         hospital_name,
         hospital_city,
         bed_count,
@@ -422,7 +422,9 @@ visit_flagged AS (
         *,
         DATEDIFF(admission_date, previous_discharge) AS days_since_last_visit,
         CASE
-            WHEN DATEDIFF(admission_date, previous_discharge) <= 30 THEN 1
+            WHEN DATEDIFF(admission_date, previous_discharge)
+            BETWEEN 0 AND 30
+            THEN 1
             ELSE 0
         END AS is_readmission_30d
     FROM visit_with_prev
@@ -431,15 +433,16 @@ visit_flagged AS (
 SELECT
     hospital_id,
     hospital_name,
+    diagnosis_code,
     diagnosis_desc,
     COUNT(*) AS total_visits,
     SUM(is_readmission_30d) AS total_readmissions,
-    ROUND(SUM(is_readmission_30d) * 1.0 / COUNT(*), 3) AS readmission_rate,
+    SUM(is_readmission_30d) * 1.0 / COUNT(*) AS readmission_rate,
     SUM(cost) AS total_cost,
     AVG(cost) AS avg_cost,
     CURRENT_TIMESTAMP() AS gold_load_timestamp
 FROM visit_flagged
-GROUP BY hospital_id, hospital_name, diagnosis_desc
+GROUP BY hospital_id, hospital_name, diagnosis_code, diagnosis_desc
 ```
 
 ### Output Schema
@@ -448,6 +451,7 @@ GROUP BY hospital_id, hospital_name, diagnosis_desc
 | :--- | :--- |
 | `hospital_id` | Hospital identifier |
 | `hospital_name` | Hospital name |
+| `diagnosis_code` | Diagnosis identifier |
 | `diagnosis_desc` | Diagnosis description |
 | `total_visits` | Number of visits for this (hospital, diagnosis) pair |
 | `total_readmissions` | Visits flagged as 30-day readmissions |
@@ -458,67 +462,30 @@ GROUP BY hospital_id, hospital_name, diagnosis_desc
 
 ### BI Questions Answered
 
-| # | Question | Query |
-| :--- | :--- | :--- |
-| 1 | Which hospital has the highest readmission rate? | `SELECT hospital_name, readmission_rate FROM ... ORDER BY readmission_rate DESC` |
-| 2 | Which disease causes the most readmissions? | `SELECT diagnosis_desc, SUM(total_readmissions) FROM ... GROUP BY diagnosis_desc ORDER BY 2 DESC` |
-| 3 | Which hospital performs worst for a given disease? | `SELECT * FROM ... WHERE diagnosis_desc = '<disease>' ORDER BY readmission_rate DESC` |
-| 4 | Which hospital spends the most? | `SELECT hospital_name, diagnosis_desc, total_cost FROM ... ORDER BY total_cost DESC` |
-
-### Sample Queries & Results
-
-Below are the four BI queries run against `gold_hospital_disease_kpi`.
-
-**Note:** The reference tutorial uses a `diagnosis_category` column (e.g., `'Cardiology'`) which is not present in this dataset. Queries here use `diagnosis_desc` instead (e.g., `'Hypertension'`).
+The Gold grain is hospital and diagnosis (assuming consistent dimension labels). Hospital-level rates must be calculated from summed counts, not averaged diagnosis-level rates. The following revised queries should be rerun against the updated Gold model; previous sample results are not treated as verified results for the revised logic.
 
 #### Q1: Which hospital has the highest readmission rate?
 
 ```sql
-SELECT
-    hospital_name,
-    readmission_rate
+SELECT hospital_id, hospital_name,
+       SUM(total_readmissions) AS total_readmissions,
+       SUM(total_visits) AS total_visits,
+       ROUND(SUM(total_readmissions) * 1.0 / NULLIF(SUM(total_visits), 0), 3) AS readmission_rate
 FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+GROUP BY hospital_id, hospital_name
 ORDER BY readmission_rate DESC;
 ```
 
-**Sample result:**
-
-| hospital_name | readmission_rate |
-| :--- | :--- |
-| Manipal Hospital | 0.5 |
-| Kokilaben Dhirubhai Hospital | 0.5 |
-| Yashoda Hospital | 0 |
-| Apollo Main Hospital | 0 |
-| Fortis Healthcare Delhi | 0 |
-
-**Insight:** Manipal Hospital and Kokilaben Dhirubhai Hospital share the highest readmission rate (0.5). The other three hospitals have no readmissions in this dataset.
-
-#### Q2: Which disease causes the most readmissions?
+#### Q2: Which disease has the most readmissions?
 
 ```sql
-SELECT
-    diagnosis_desc,
-    SUM(total_readmissions) AS total_readm
+SELECT diagnosis_code, diagnosis_desc, SUM(total_readmissions) AS total_readm
 FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
-GROUP BY diagnosis_desc
+GROUP BY diagnosis_code, diagnosis_desc
 ORDER BY total_readm DESC;
 ```
 
-**Sample result:**
-
-| diagnosis_desc | total_readm |
-| :--- | :--- |
-| Chest Pain | 1 |
-| Kidney Infection | 1 |
-| Diabetes Type 2 | 0 |
-| Asthma | 0 |
-| Hypertension | 0 |
-
-**Insight:** Chest Pain and Kidney Infection each have 1 readmission. The other three diseases have 0 readmissions in this dataset.
-
-#### Q3: Which hospital performs worst for a given disease?
-
-Uses `Chest Pain` as an example.
+#### Q3: Which hospital has the highest rate for Chest Pain?
 
 ```sql
 SELECT *
@@ -530,25 +497,13 @@ ORDER BY readmission_rate DESC;
 #### Q4: Which hospital spends the most?
 
 ```sql
-SELECT
-    hospital_name,
-    diagnosis_desc,
-    total_cost
+SELECT hospital_id, hospital_name, SUM(total_cost) AS total_cost
 FROM z_dbt_hospital.gold.gold_hospital_disease_kpi
+GROUP BY hospital_id, hospital_name
 ORDER BY total_cost DESC;
 ```
 
-**Sample result:**
-
-| hospital_name | diagnosis_desc | total_cost |
-| :--- | :--- | :--- |
-| Manipal Hospital | Kidney Infection | 38000 |
-| Fortis Healthcare Delhi | Hypertension | 35000 |
-| Kokilaben Dhirubhai Hospital | Chest Pain | 21000 |
-| Apollo Main Hospital | Diabetes Type 2 | 20000 |
-| Yashoda Hospital | Asthma | 14000 |
-
-**Insight:** Manipal Hospital has the highest total cost for a single (hospital, disease) pair — 38000 for Kidney Infection.
+The reference tutorial uses `diagnosis_category`, which is not present in this dataset. This project uses diagnosis codes and descriptions. With only eight original visits, these results illustrate the pipeline rather than establish clinical performance.
 
 ---
 
@@ -570,7 +525,7 @@ Schema: z_dbt_hospital.bronze      ← typed raw data
 Schema: z_dbt_hospital.silver      ← 3 dims + 1 fact
     ├── dim_diagnosis
     ├── dim_hospital
-    ├── dim_patient
+    ├── dim_patient ── dbt snapshot ──► snapshots.dim_patient_snapshot (SCD2)
     └── fact_visit
     │
     │ dbt Gold (gold_hospital_disease_kpi)
@@ -586,14 +541,15 @@ Schema: z_dbt_hospital.gold        ← KPI table
 | Decision | Rationale |
 | :--- | :--- |
 | **Auto Loader writes to `source`, not `bronze`** | Keeps "raw ingestion" separate from "typed/amended data" |
-| **`_ingested_at` added at Bronze write time** | Audit column + deduplication ordering key |
-| **`_rescued_data` dropped** | Auto Loader fault-tolerance column, no business value |
+| **`_ingested_at` added at Source ingestion time** | Audit column + deduplication ordering key |
+| **`_rescued_data` dropped** | Not selected downstream; retain in Source for investigation |
 | **IDs remain `STRING`** | Contain prefixes (V/P/H/D), not pure numbers |
 | **dbt Bronze = type casting only** | Separation of concerns |
-| **Silver uses SCD1 (merge)** | No history required for this dataset |
+| **Silver uses SCD1 (merge)** | Current-state dimensions; patient history is maintained separately |
 | **`incremental_strategy='merge'`** | Makes it SCD1, not append |
-| **Patient name hashed with SHA-256** | PII protection |
-| **Gold uses LAG + DATEDIFF** | CMS-standard 30-day readmission window |
+| **Patient name hashed with SHA-256** | Pseudonymization, not anonymization |
+| **Patient SCD2 snapshot** | Track selected attribute changes without changing the current-state fact pipeline |
+| **Gold uses LAG + DATEDIFF** | Project-specific 0–30-day readmission window |
 
 ---
 
@@ -624,121 +580,97 @@ This project follows the same Medallion architecture as the reference tutorial (
 >
 > Reference: [Databricks docs — Upsert into a Delta Lake table using merge](https://docs.databricks.com/aws/en/delta/merge)
 
-#### Why SCD1 and not SCD2?
+#### SCD1 and SCD2 coexist in this project
 
-The reference implementation (and this project) uses **SCD1** — only the latest state per key is kept. This is sufficient for this dataset because:
+The three Silver dimensions retain one current row per business key using incremental MERGE. `fact_visit` retains one row per visit and supports corrections through upsert. The patient snapshot separately records historical versions of selected patient attributes. Hospital and diagnosis history are outside the current snapshot scope.
 
-- Visit, patient, hospital, and diagnosis records are effectively **immutable** (they don't change after creation).
-- Historical tracking is not a business requirement here.
-- SCD1 is simpler and cheaper.
+#### SCD2 in dbt: `dim_patient_snapshot`
 
-**If SCD2 were needed** (e.g., patients' addresses change over time), the merge logic would need to change:
+The snapshot reads the deduplicated, pseudonymized `dim_patient` rather than the append-only raw source. This prevents multiple source rows per patient from reaching the snapshot in one run.
 
-```python
-# 1. Instead of UpdateAll, mark the old version as expired
-.whenMatchedUpdate(set = {
-    "is_current": "false",
-    "__END_AT":   "current_timestamp()"
-})
-
-# 2. Then INSERT a new version (with __START_AT = now, is_current = true)
-```
-
-Or in DLT (Lakeflow Pipelines), this is handled declaratively:
-
-```python
-dp.create_auto_cdc_flow(
-    target = "silver.dim_patient",
-    source = "bronze.patient_raw",
-    keys = ["patient_id"],
-    sequence_by = col("updated_at"),
-    stored_as_scd_type = 2     # ← SCD2
-)
-```
-
-**Note:** SCD2 requires the source to provide a reliable "sequence column" (e.g., `updated_at`). In this dataset, no such column exists, so SCD1 is the natural choice.
-
-**Note on dim vs. fact:**
-- **Dimension tables** (`dim_patient`, `dim_hospital`, `dim_diagnosis`) — SCD2 is often a good fit, because dimension attributes change over time (address, bed count). This project uses SCD1 for simplicity; SCD2 would be a natural extension.
-- **Fact tables** (`fact_visit`) — SCD1 (or even `append`) is typically preferred, because fact events are immutable. Historical fact versions are usually not needed.
-
-#### SCD2 in dbt: `dbt snapshot`
-
-dbt has **native SCD2 support** via `dbt snapshot`. Instead of writing custom merge logic, you declare the snapshot config and dbt maintains the history automatically.
-
-There are two `strategy` options:
-
-| Strategy | Requires | How it detects changes |
+| Strategy | Requirement | Change detection |
 | :--- | :--- | :--- |
-| `timestamp` | An `updated_at` column | Row changed if `updated_at` is newer |
-| **`check`** | No timestamp needed | Row changed if any of the checked columns changed |
+| `timestamp` | Reliable update timestamp | Newer update timestamp |
+| `check` | Selected attributes | Comparison of attribute values |
 
-Since this dataset has **no `updated_at` column**, `strategy='check'` would be used.
+The source has no business `updated_at`, so the project uses `check`. `_ingested_at` is retained for lineage but excluded from change detection.
 
-**Snapshot definition** (`snapshots/dim_patient_snapshot.sql`):
+**File:** `snapshots/dim_patient_snapshot.sql`
 
 ```sql
 {% snapshot dim_patient_snapshot %}
 
-{{
-    config(
-      target_schema='snapshots',
-      unique_key='patient_id',
-      strategy='check',
-      check_cols=['city', 'gender', 'dob']
-    )
-}}
+{{ config(
+    target_database=target.catalog,
+    target_schema='snapshots',
+    unique_key='patient_id',
+    strategy='check',
+    check_cols=['city', 'gender', 'dob', 'patient_first_last_name_masked']
+) }}
 
 SELECT
     patient_id,
-    first_name,
-    last_name,
     gender,
     dob,
-    city
-FROM {{ source('hospital_source', 'patient') }}
+    city,
+    patient_first_last_name_masked,
+    _ingested_at
+FROM {{ ref('dim_patient') }}
 
 {% endsnapshot %}
 ```
 
-**Run it:**
+The SQL snapshot uses the legacy target configuration syntax; confirm the resolved catalog and schema with the installed dbt-databricks version before running in prod.
 
 ```bash
-dbt snapshot
+dbt run --target dev --select +dim_patient
+dbt snapshot --target dev --select dim_patient_snapshot
 ```
-
-**Config breakdown:**
-
-| Key | Value | Purpose |
-| :--- | :--- | :--- |
-| `unique_key` | `patient_id` | Business key to track |
-| `strategy` | `check` | Detect changes by comparing column values |
-| `check_cols` | `['city', 'gender', 'dob']` | Columns to monitor for changes |
-| `target_schema` | `snapshots` | Where the snapshot table lives |
-
-**What dbt does automatically:**
 
 | Column | Purpose |
 | :--- | :--- |
-| `dbt_scd_id` | Surrogate key for each version |
-| `dbt_updated_at` | When the snapshot row was last captured |
-| `dbt_valid_from` | When this version became active |
-| `dbt_valid_to` | When this version was superseded (NULL = current) |
+| `dbt_scd_id` | Identifier for a historical version |
+| `dbt_updated_at` | Snapshot change timestamp |
+| `dbt_valid_from` | Start of observed version |
+| `dbt_valid_to` | End of observed version; NULL means current |
 
-On each `dbt snapshot` run:
-1. **New rows** → inserted with `dbt_valid_to = NULL`.
-2. **Changed rows** (any `check_cols` value differs) → old version closed (`dbt_valid_to = now`), new version inserted with `dbt_valid_from = now`.
-3. **Unchanged rows** → left as is.
-4. Rows with `dbt_valid_to IS NULL` are the **current version**.
+New patients are inserted; changed attributes close the previous version and create a new current version. Unchanged attributes do not create a new version.
 
-**Why `strategy='check'` and not `timestamp`?**
-- The source (`patient`) has no `updated_at` column.
-- `strategy='check'` works by comparing column values between runs — no timestamp needed.
+#### SCD2 validation procedure
 
-**Why this project uses SCD1 instead:**
-- No business need for historical tracking.
-- SCD1 (merge) is simpler and cheaper.
-- SCD2 (snapshot) is shown here as a reference for future extensions.
+Run the initial snapshot, then append a controlled patient-city change in dev. Use explicit column names because the source may contain `_rescued_data`.
+
+```sql
+INSERT INTO z_dbt_hospital.source.patient
+    (patient_id, first_name, last_name, gender, dob, city, _ingested_at)
+SELECT patient_id, first_name, last_name, gender, dob,
+       CONCAT(city, ' - SCD2 test'), CURRENT_TIMESTAMP()
+FROM z_dbt_hospital.source.patient
+WHERE patient_id = 'P001'
+QUALIFY ROW_NUMBER() OVER (ORDER BY _ingested_at DESC) = 1;
+```
+
+```bash
+dbt run --target dev --select +dim_patient
+dbt snapshot --target dev --select dim_patient_snapshot
+```
+
+```sql
+SELECT patient_id, city, dbt_valid_from, dbt_valid_to
+FROM z_dbt_hospital.snapshots.dim_patient_snapshot
+WHERE patient_id = 'P001'
+ORDER BY dbt_valid_from;
+```
+
+Expected result for a clean initial test: one closed version and one current version. Rerunning without attribute changes should not create another version. Actual execution results and screenshots should be captured during the next rerun.
+
+#### Snapshot limitations
+
+- Snapshot validity reflects observation time, not the actual business-effective time.
+- Intermediate changes overwritten in SCD1 between snapshot runs are not captured. Historical backfill from retained Source observations would be a separate process.
+- The fact does not join to historical patient versions; this snapshot is an independent history table, not a point-in-time fact enrichment.
+- Hashing names does not anonymize patient IDs, DOB or other identifying attributes. Restrict access to Source, Bronze and snapshots; use synthetic data for public demonstrations.
+
 
 ### 8.3 Improvement: Fact Table Deduplication
 
@@ -750,19 +682,20 @@ On each `dbt snapshot` run:
 QUALIFY ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY _ingested_at DESC) = 1
 ```
 
-**Why:** if Auto Loader re-runs, `brz_visit` may contain duplicate `visit_id`. Without dedup, `fact_visit` would have duplicates.
+**Why:** different files may contain repeated or corrected visit IDs. Auto Loader checkpointing tracks files, not business-key uniqueness. Multiple source rows for one key can cause ambiguous MERGE matches or duplicate inserts.
 
-**Conclusion:** the reference is **pedagogically simplified**. This project adopts a **production-oriented** approach.
+**Conclusion:** the reference is **pedagogically simplified**. This project explicitly deduplicates incoming business keys, although equal timestamps still require a reliable tie-breaker.
 
 ### 8.4 Job Orchestration: dbt run vs. Asset Bundle
 
 The reference implementation uses **Databricks Asset Bundle** (`reference_bundle_job_file.yml`) to define an end-to-end Job with 8 Notebook tasks and `depends_on` dependencies.
 
-This project uses **`dbt run`** as the orchestration layer:
+This project uses **dbt CLI and its dependency DAG** for transformation execution. External scheduling of ingestion and dbt is separate:
 
 ```bash
 dbt run --select bronze
 dbt run --select silver
+dbt snapshot
 dbt run --select gold
 dbt test
 ```
@@ -771,7 +704,7 @@ dbt test
 | :--- | :--- | :--- |
 | **Definition** | YAML (`reference_bundle_job_file.yml`) | CLI commands |
 | **Dependencies** | `depends_on` in YAML | Implicit in `{{ ref() }}` DAG |
-| **Deployment** | `databricks bundle deploy` | `git push` + CI/CD |
+| **Deployment** | `databricks bundle deploy` | Target-specific dbt CLI; automated CI/CD is not demonstrated here |
 | **Testing** | Separate Notebook | `dbt test` (built-in) |
 
 **Both approaches are valid.** Asset Bundle is suitable for teams managing many Notebook-based Jobs. dbt is suitable for SQL-heavy transformations with built-in lineage and testing.
@@ -783,7 +716,7 @@ dbt test
 | **Databricks Volumes** | Store raw CSV files |
 | **Auto Loader (cloudFiles)** | Incremental CSV ingestion |
 | **Delta Lake** | Storage format |
-| **dbt (dbt-databricks)** | SQL transformations, SCD1, tests, docs |
+| **dbt (dbt-databricks)** | SQL transformations, SCD1, SCD2 snapshots, tests, docs |
 | **Databricks SQL Warehouse** | Query engine for dbt |
 
 ## 10. How to Run
@@ -798,13 +731,16 @@ dbt run --select bronze
 # 3. Run dbt Silver models
 dbt run --select silver
 
-# 4. Run dbt Gold models
+# 4. Capture patient history
+dbt snapshot --select dim_patient_snapshot
+
+# 5. Run dbt Gold models
 dbt run --select gold
 
-# 5. Test
+# 6. Test
 dbt test
 
-# 6. Generate docs
+# 7. Generate docs
 dbt docs generate
 dbt docs serve
 ```
@@ -866,6 +802,7 @@ To verify that `dev` and `prod` are truly isolated, a test row was inserted only
 
 ```sql
 INSERT INTO z_dbt_hospital_prod.source.diagnosis
+    (diagnosis_code, diagnosis_desc, _ingested_at)
 VALUES ('D999', 'Test Disease', CURRENT_TIMESTAMP());
 ```
 
@@ -887,7 +824,7 @@ SELECT * FROM z_dbt_hospital.bronze.brz_diagnosis WHERE diagnosis_code = 'D999';
 -- → 0 rows
 ```
 
-**Conclusion:** The two catalogs are physically isolated. Running `dbt run --target prod` only affects `z_dbt_hospital_prod`, and `dbt run --target dev` only affects `z_dbt_hospital`.
+**Conclusion:** The test demonstrates separate catalog data for the tested model path. Full isolation also depends on target-aware model and snapshot configuration, permissions and ingestion paths.
 
 ### 11.4 `sources.yml` Uses `target.catalog`
 
@@ -917,13 +854,15 @@ sources:
 ```bash
 # Deploy to dev
 dbt run --target dev
+dbt snapshot --target dev
 dbt test --target dev
 
 # Deploy to prod
 dbt run  --target prod
+dbt snapshot --target prod
 dbt test --target prod
 
-# Full refresh (first prod run)
+# Optional rebuild of incremental models (not required for first run)
 dbt run --target prod --full-refresh
 ```
 
@@ -933,7 +872,7 @@ The Gold table `gold_hospital_disease_kpi` and the Silver table `fact_visit` are
 
 ### Questions & Results
 
-Four questions were asked via Genie. The captured results are stored in the `assets/` folder:
+Four questions were asked via Genie in the earlier implementation. The captured results are stored in the `assets/` folder; rerun and validate them against the revised KPI definition:
 
 | # | Question | Result file |
 | :--- | :--- | :--- |
@@ -945,7 +884,7 @@ Four questions were asked via Genie. The captured results are stored in the `ass
 ### Notes
 
 - Genie auto-generates SQL from natural language, lowering the barrier for business users.
-- Q3 and Q4 require the Silver `fact_visit` table (date columns), not just the Gold KPI table.
+- Q3 and Q4 require visit-level dates. Q3 should use patient ID rather than raw patient names; review the existing PDF for identifying information before publishing. Genie-generated SQL must be checked against the same readmission definition.
 
 ## 13. Dashboard
 
@@ -960,7 +899,29 @@ A Databricks Dashboard was built on top of `gold_hospital_disease_kpi` with four
 
 The dashboard is stored in the Databricks Workspace and is scheduled to send daily email snapshots.
 
-Snapshot: `assets/dashboard.png`.
+Snapshot: `assets/dashboard.png` (earlier implementation). Refresh after rerunning the revised models. Hospital-level rates must use summed numerators and denominators.
+
+## 14. Data Quality and Known Limitations
+
+The original dataset contains 5 diagnosis, 5 hospital, 5 patient and 8 visit records. These are baseline source counts, not post-test counts.
+
+Recommended dbt tests to configure and execute:
+
+- `unique` and `not_null` on each Silver business key.
+- `relationships` from fact keys to the corresponding dimensions.
+- Nonnegative cost and discharge date on or after admission date.
+- Exactly one current snapshot row per patient and nonoverlapping version intervals.
+- Reconcile Gold `SUM(total_visits)` and `SUM(total_cost)` to Silver fact counts and costs.
+
+The current incremental filter uses `_ingested_at > MAX(_ingested_at)`. Rows arriving at the same watermark can be missed; equal timestamps also make deduplication ambiguous. A bounded lookback with deterministic ordering and protection against older versions overwriting newer rows is a possible enhancement. Ingestion time is not a reliable business change sequence.
+
+`fact_visit` embeds dimension attributes and only processes incoming visits. A dimension-only update therefore does not refresh existing fact rows. For current-state reporting, a future normalized fact with query-time dimension joins or explicit affected-key reprocessing would resolve this. Until then, changed dimension labels can split Gold groups. A full refresh can rebuild current-state enrichment but cannot recover historical effective attributes.
+
+The readmission metric uses the immediately preceding same-diagnosis visit and assumes nonoverlapping episodes. It does not model transfers, planned admissions, eligibility, risk adjustment or follow-up censoring. The denominator is all observed visits, not eligible index discharges. Validate overlapping visits separately.
+
+`_rescued_data` is retained in Source but not monitored in the current transformation. Production pipelines should inspect and quarantine malformed records. Explicit casts can fail on invalid input. The current cost type is DOUBLE; DECIMAL is preferable for exact monetary reconciliation.
+
+The dev/prod setup demonstrates catalog separation using CTAS, not independent scheduled production ingestion. The snapshot and revised Gold SQL are documented for the updated implementation; runtime validation is to be completed during the rerun.
 
 ## Reference Tutorial
 

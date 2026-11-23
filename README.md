@@ -204,7 +204,7 @@ A reusable PySpark utility is used to dynamically discover and inspect all table
 
 ```python
 catalog = "z_dbt_hospital"
-schema = "bronze"
+schema = "source"
 
 tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
 
@@ -217,7 +217,7 @@ for table in tables:
     print(f"Row Count: {df.count()}")
     print("=" * 80)
 
-    df.printSchema()
+    display(spark.sql(f"DESCRIBE TABLE {full_name}"))
     display(df)
 ```
 

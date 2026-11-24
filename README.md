@@ -204,21 +204,22 @@ A reusable PySpark utility is used to dynamically discover and inspect all table
 
 ```python
 catalog = "z_dbt_hospital"
-schema = ["source", "bronze", "silver", "gold", "snapshots"]
+schemas = ["source", "bronze", "silver", "gold", "snapshots"]
 
-tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
+for schema in schemas:
+    tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
 
-for table in tables:
-    full_name = f"{catalog}.{schema}.{table.tableName}"
-    df = spark.table(full_name)
+    for table in tables:
+        full_name = f"{catalog}.{schema}.{table.tableName}"
+        df = spark.table(full_name)
 
-    print("=" * 80)
-    print(f"Table: {full_name}")
-    print(f"Row Count: {df.count()}")
-    print("=" * 80)
+        print("=" * 80)
+        print(f"Table: {full_name}")
+        print(f"Row Count: {df.count()}")
+        print("=" * 80)
 
-    display(spark.sql(f"DESCRIBE TABLE {full_name}"))
-    display(df)
+        display(spark.sql(f"DESCRIBE TABLE {full_name}"))
+        display(df)
 ```
 
 #### Validation Objectives
@@ -947,7 +948,7 @@ with
             discharge_date,
             cost,
             lag(discharge_date) over (
-                partition by patient_id, diagnosis_code order by admission_date
+                partition by patient_id, diagnosis_code order by admission_date, visit_id
             ) as previous_discharge
         from {{ ref('fact_visit') }}
     ),
@@ -1790,13 +1791,16 @@ Snapshot: `assets/dashboard.png` (earlier implementation). Refresh after rerunni
 
 The original dataset contains 5 diagnosis, 5 hospital, 5 patient and 8 visit records. These are baseline source counts, not post-test counts.
 
-Recommended dbt tests to configure and execute:
+The project defines 20 dbt data quality tests across
+the Silver and Gold layers.
 
-- `unique` and `not_null` on each Silver business key.
-- `relationships` from fact keys to the corresponding dimensions.
-- Nonnegative cost and discharge date on or after admission date.
-- Exactly one current snapshot row per patient and nonoverlapping version intervals.
-- Reconcile Gold `SUM(total_visits)` and `SUM(total_cost)` to Silver fact counts and costs.
+Potential additional validation includes:
+
+- Nonnegative visit cost and valid admission/discharge dates.
+- Composite key uniqueness at the Gold aggregation grain.
+- Exactly one current snapshot row per patient.
+- Nonoverlapping snapshot validity intervals.
+- Reconciliation of Gold metrics against Silver fact records.
 
 The current incremental filter uses `_ingested_at > MAX(_ingested_at)`. Rows arriving at the same watermark can be missed; equal timestamps also make deduplication ambiguous. A bounded lookback with deterministic ordering and protection against older versions overwriting newer rows is a possible enhancement. Ingestion time is not a reliable business change sequence.
 

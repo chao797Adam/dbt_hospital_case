@@ -1316,7 +1316,30 @@ WHERE patient_id = 'P001'
 ORDER BY dbt_valid_from;
 ```
 
-Expected result for a clean initial test: one closed version and one current version. Rerunning without attribute changes should not create another version. Actual execution results and screenshots should be captured during the next rerun.
+#### SCD Type 2 — Incremental Change Validation
+
+An incremental CSV file was uploaded to update patient
+P001's city from Mumbai to Pune.
+
+The dbt snapshot successfully detected the attribute
+change, closed the historical record, and created a
+new current record.
+
+**Actual Validation Results:**
+
+| Patient ID | City | Status | dbt_valid_to |
+| :--- | :--- | :--- | :--- |
+| P001 | Mumbai | Historical | 2026-11-24 04:11:26.740 UTC |
+| P001 | Pune | Current | NULL |
+
+The historical record's `dbt_valid_to` matches the new
+record's `dbt_valid_from`, confirming continuous
+version history without temporal gaps.
+
+![SCD2 Patient City Change](./assets/scd2_patient_city_change.png)
+
+Rerunning the snapshot without changes to the tracked
+attributes should not create another historical version.
 
 #### Snapshot limitations
 

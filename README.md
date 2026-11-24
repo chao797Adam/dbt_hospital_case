@@ -204,7 +204,7 @@ A reusable PySpark utility is used to dynamically discover and inspect all table
 
 ```python
 catalog = "z_dbt_hospital"
-schema = "source"
+schema = ["source", "bronze", "silver", "gold", "snapshots"]
 
 tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
 

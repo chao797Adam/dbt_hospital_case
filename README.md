@@ -884,8 +884,6 @@ dbt build --select silver
 
 The expected outcome is 14 passing tests with no failures.
 
-Actual execution results will be recorded after validation.
-
 #### Design Considerations
 
 - Incremental MERGE reduces unnecessary full-table processing.
@@ -1090,8 +1088,6 @@ dbt build --select gold
 | Generic Tests (not_null) | 5 |
 | Singular Test (Business Rules) | 1 |
 | **Total** | **6** |
-
-Actual execution results will be recorded after validation.
 
 #### Cross-Layer Data Quality Strategy
 
@@ -1752,6 +1748,33 @@ dbt test --target prod
 dbt run --target prod --full-refresh
 ```
 
+### 10.7 Production Data Quality Validation
+
+After deploying the dbt models to the production catalog
+(`z_dbt_hospital_prod`), all 20 data quality tests were
+successfully executed.
+
+```bash
+dbt test --target prod
+```
+
+```text
+Done. PASS=20 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=20
+```
+
+| Metric | Result |
+| :--- | :--- |
+| Target | prod |
+| Catalog | z_dbt_hospital_prod |
+| Silver Tests | 14/14 Passed |
+| Gold Tests | 6/6 Passed |
+| Total Tests | 20/20 Passed |
+| Success Rate | 100% |
+| Execution Time | 22.07 seconds |
+
+The production models satisfy all currently defined
+structural and business-level data quality rules.
+
 ## 11. Genie: Natural Language BI
 
 The Gold table `gold_hospital_disease_kpi` and the Silver table `fact_visit` are exposed to **Databricks Genie** for natural-language BI.
@@ -1789,18 +1812,17 @@ Snapshot: `assets/dashboard.png` (earlier implementation). Refresh after rerunni
 
 ## 13. Data Quality and Known Limitations
 
-The original dataset contains 5 diagnosis, 5 hospital, 5 patient and 8 visit records. These are baseline source counts, not post-test counts.
+The original dataset contains 5 diagnosis, 5 hospital,
+5 patient and 8 visit records. These are baseline
+source counts, not post-test counts.
 
-The project defines 20 dbt data quality tests across
-the Silver and Gold layers.
+All 20 dbt data quality tests passed in the production
+environment, including 14 Silver tests and 6 Gold tests.
 
-Potential additional validation includes:
+Actual execution results are documented in
+Section 10.7 — Production Data Quality Validation.
 
-- Nonnegative visit cost and valid admission/discharge dates.
-- Composite key uniqueness at the Gold aggregation grain.
-- Exactly one current snapshot row per patient.
-- Nonoverlapping snapshot validity intervals.
-- Reconciliation of Gold metrics against Silver fact records.
+### Known Limitations
 
 The current incremental filter uses `_ingested_at > MAX(_ingested_at)`. Rows arriving at the same watermark can be missed; equal timestamps also make deduplication ambiguous. A bounded lookback with deterministic ordering and protection against older versions overwriting newer rows is a possible enhancement. Ingestion time is not a reliable business change sequence.
 

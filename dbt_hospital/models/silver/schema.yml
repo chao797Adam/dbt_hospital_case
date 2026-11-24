@@ -1,0 +1,58 @@
+version: 2
+
+models:
+  - name: dim_diagnosis
+    description: "SCD Type 1 diagnosis dimension"
+    columns:
+      - name: diagnosis_code
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_hospital
+    description: "SCD Type 1 hospital dimension"
+    columns:
+      - name: hospital_id
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_patient
+    description: "SCD Type 1 patient dimension with pseudonymized patient names"
+    columns:
+      - name: patient_id
+        data_tests:
+          - unique
+          - not_null
+
+  - name: fact_visit
+    description: "Incremental hospital visit fact table"
+    columns:
+      - name: visit_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: patient_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_patient')
+                field: patient_id
+
+      - name: hospital_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_hospital')
+                field: hospital_id
+
+      - name: diagnosis_code
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_diagnosis')
+                field: diagnosis_code

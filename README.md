@@ -437,6 +437,319 @@ LEFT JOIN hospital  h ON v.hospital_id   = h.hospital_id
 LEFT JOIN diagnosis d ON v.diagnosis_code = d.diagnosis_code
 ```
 
+### Silver Layer — Dimensional Modeling & Referential Integrity
+
+The Silver layer consists of three SCD Type 1 dimensions and one
+incrementally maintained, denormalized fact table.
+
+#### Entity Relationship Diagram (ERD)
+
+```mermaid
+erDiagram
+    dim_patient ||--o{ fact_visit : patient_id
+    dim_hospital ||--o{ fact_visit : hospital_id
+    dim_diagnosis ||--o{ fact_visit : diagnosis_code
+
+    dim_patient {
+        string patient_id PK
+        string patient_first_last_name_masked
+        string city
+        string gender
+        date dob
+    }
+
+    dim_hospital {
+        string hospital_id PK
+        string hospital_name
+        string city
+        int bed_count
+    }
+
+    dim_diagnosis {
+        string diagnosis_code PK
+        string diagnosis_desc
+    }
+
+    fact_visit {
+        string visit_id PK
+        string patient_id FK
+        string hospital_id FK
+        string diagnosis_code FK
+        date admission_date
+        date discharge_date
+        double cost
+    }
+```
+
+The diagram illustrates the logical relationships between the
+fact table and its associated dimensions. Selected business
+columns are shown for readability.
+
+#### Model Grain and Update Strategy
+
+| Model | Grain | Business Key | Update Strategy |
+| :--- | :--- | :--- | :--- |
+| dim_patient | One row per patient | patient_id | SCD Type 1 |
+| dim_hospital | One row per hospital | hospital_id | SCD Type 1 |
+| dim_diagnosis | One row per diagnosis | diagnosis_code | SCD Type 1 |
+| fact_visit | One row per hospital visit | visit_id | Incremental Upsert |
+
+All four models use incremental MERGE processing.
+
+The dimension models maintain the latest business state without
+retaining historical versions. Historical patient changes are
+tracked separately through dbt snapshots using SCD Type 2.
+
+#### Audit Timestamps
+
+| Column | Purpose |
+| :--- | :--- |
+| `_ingested_at` | Original ingestion timestamp used for incremental filtering and deduplication |
+| `silver_load_timestamp` | Silver processing timestamp used for auditing and pipeline monitoring |
+
+#### PII Protection
+
+Original patient names are retained in the restricted Source
+and Bronze layers.
+
+In the Silver layer, first_name and last_name are excluded
+from the output and replaced with a SHA256 hash.
+
+This reduces direct exposure of patient names in downstream
+analytical models.
+
+Hashing provides pseudonymization rather than complete
+anonymization. Appropriate access controls remain necessary.
+
+#### Data Modeling Strategy — Star Schema vs OBT
+
+This project adopts a hybrid data modeling approach that
+combines independently maintained SCD Type 1 dimensions
+with a denormalized, OBT-style fact table.
+
+Unlike a traditional star schema, where the fact table
+primarily stores foreign keys and business measures,
+`fact_visit` also contains descriptive attributes from
+the patient, hospital, and diagnosis dimensions.
+
+```mermaid
+flowchart TD
+    B[brz_visit] --> J[LEFT JOIN]
+    P[dim_patient] --> J
+    H[dim_hospital] --> J
+    D[dim_diagnosis] --> J
+    J --> F["fact_visit - Denormalized OBT"]
+    F --> G[Gold KPI Aggregation]
+```
+
+##### Design Comparison
+
+| Aspect | Traditional Star Schema | Current OBT-style Design |
+| :--- | :--- | :--- |
+| Fact Grain | One row per visit | One row per visit |
+| Dimension Attributes | Stored separately | Embedded in the fact table |
+| Join Strategy | Query-time joins | Load-time joins |
+| Data Redundancy | Lower | Higher |
+| Downstream Complexity | Higher | Lower |
+| Dimension Change Propagation | Available through joins | Requires fact reprocessing |
+| Referential Integrity | Required | Required |
+
+##### Design Rationale
+
+The denormalized fact table is designed to simplify
+downstream Gold transformations and analytical queries.
+
+Independent dimension tables are retained to support:
+
+- SCD Type 1 dimension management.
+- Reusable and standardized business entities.
+- Primary key and foreign key validation.
+- Referential integrity testing.
+- SCD Type 2 historical tracking for patient attributes.
+
+The Gold layer consumes the enriched fact table directly
+without repeating the dimension joins.
+
+##### Design Trade-offs
+
+Denormalization introduces data redundancy and additional
+storage requirements.
+
+Changes to dimension attributes do not automatically
+propagate to existing fact records unless the affected
+visits are reprocessed.
+
+This is a known limitation of the current incremental
+OBT-style implementation.
+
+##### ERD vs Data Lineage
+
+The ERD represents logical primary key and foreign key
+relationships between the fact and dimension tables.
+
+The data lineage diagram represents the physical
+transformation process used to construct the enriched
+fact table.
+
+The logical relationships do not imply that the dimension
+joins must be repeated in downstream transformations.
+
+### Silver Layer — Data Quality Testing
+
+Data quality tests are defined using dbt generic tests to
+validate primary keys, foreign keys, and referential integrity
+before downstream Gold transformations.
+
+#### Test Coverage
+
+| Model | Column | Data Quality Tests |
+| :--- | :--- | :--- |
+| dim_diagnosis | diagnosis_code | unique, not_null |
+| dim_hospital | hospital_id | unique, not_null |
+| dim_patient | patient_id | unique, not_null |
+| fact_visit | visit_id | unique, not_null |
+| fact_visit | patient_id | not_null, relationships |
+| fact_visit | hospital_id | not_null, relationships |
+| fact_visit | diagnosis_code | not_null, relationships |
+
+A total of 14 generic data quality tests are defined.
+
+#### Test Configuration
+
+File: `models/silver/schema.yml`
+
+```yaml
+version: 2
+
+models:
+  - name: dim_diagnosis
+    description: "SCD Type 1 diagnosis dimension"
+    columns:
+      - name: diagnosis_code
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_hospital
+    description: "SCD Type 1 hospital dimension"
+    columns:
+      - name: hospital_id
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_patient
+    description: "SCD Type 1 patient dimension with pseudonymized names"
+    columns:
+      - name: patient_id
+        data_tests:
+          - unique
+          - not_null
+
+  - name: fact_visit
+    description: "Incrementally maintained hospital visit fact table"
+    columns:
+      - name: visit_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: patient_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_patient')
+                field: patient_id
+
+      - name: hospital_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_hospital')
+                field: hospital_id
+
+      - name: diagnosis_code
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_diagnosis')
+                field: diagnosis_code
+```
+
+#### Data Quality Objectives
+
+| Test | Objective |
+| :--- | :--- |
+| unique | Validate that business keys contain no duplicate values |
+| not_null | Ensure mandatory business keys are populated |
+| relationships | Detect orphan foreign keys in the fact table |
+
+The unique_key configuration used by incremental MERGE
+does not automatically enforce uniqueness.
+
+Explicit dbt tests are therefore required to validate
+the resulting data.
+
+LEFT JOIN operations preserve hospital visit records even
+when a corresponding dimension record is missing.
+
+Relationship tests detect these unmatched foreign keys
+without silently discarding the original visit records.
+
+#### Test Execution
+
+```bash
+dbt run --select silver
+dbt test --select silver
+```
+
+Alternatively, model execution and testing can be combined:
+
+```bash
+dbt build --select silver
+```
+
+#### Expected Validation Results
+
+| Test Category | Expected Tests |
+| :--- | ---: |
+| Uniqueness | 4 |
+| Not Null | 7 |
+| Referential Integrity | 3 |
+| **Total** | **14** |
+
+The expected outcome is 14 passing tests with no failures.
+
+Actual execution results will be recorded after validation.
+
+#### Design Considerations
+
+- Incremental MERGE reduces unnecessary full-table processing.
+- ROW_NUMBER deduplication retains the latest record per business key.
+- SCD Type 1 dimensions maintain the latest business state.
+- dbt snapshots provide separate SCD Type 2 historical tracking.
+- SHA256 hashing reduces direct exposure of patient names.
+- Audit timestamps improve pipeline observability.
+- Generic data tests validate key integrity before Gold processing.
+
+#### Known Limitations
+
+The fact table contains denormalized dimension attributes.
+
+Changes to dimension attributes alone do not automatically
+refresh existing fact records unless the corresponding visit
+is reprocessed.
+
+The incremental watermark uses a strict greater-than condition.
+Records arriving with an ingestion timestamp equal to or older
+than the current watermark may be missed.
+
+Potential enhancements include dimension change propagation,
+lookback windows, and additional business rule validation.
+
 ---
 
 ## 5. Gold Layer: Hospital Disease KPI

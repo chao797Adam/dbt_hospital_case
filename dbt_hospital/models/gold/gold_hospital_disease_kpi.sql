@@ -18,8 +18,6 @@ with
             patient_city,
             gender,
             dob,
-            first_name,
-            last_name,
             hospital_name,
             hospital_city,
             bed_count,

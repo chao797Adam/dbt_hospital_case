@@ -34,8 +34,6 @@ select
     p.city as patient_city,
     p.gender,
     p.dob,
-    p.first_name,
-    p.last_name,
 
     h.hospital_name,
     h.city as hospital_city,

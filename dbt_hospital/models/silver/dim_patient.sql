@@ -8,8 +8,6 @@ with
     source as (
         select
             patient_id,
-            first_name,
-            last_name,
             sha2(
                 concat_ws('|', first_name, last_name), 256
             ) as patient_first_last_name_masked,

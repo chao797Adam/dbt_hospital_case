@@ -437,12 +437,35 @@ LEFT JOIN hospital  h ON v.hospital_id   = h.hospital_id
 LEFT JOIN diagnosis d ON v.diagnosis_code = d.diagnosis_code
 ```
 
-### Silver Layer — Dimensional Modeling & Referential Integrity
+## Silver Layer — Dimensional Modeling & Referential Integrity
 
-The Silver layer consists of three SCD Type 1 dimensions and one
-incrementally maintained, denormalized fact table.
+The Silver layer consists of three independently maintained
+SCD Type 1 dimensions and one incrementally maintained,
+denormalized OBT-style fact table.
 
-#### Entity Relationship Diagram (ERD)
+This section compares a traditional star schema with the
+current project's OBT-style implementation, highlighting
+the differences in layer responsibilities, dimension
+attributes, join strategies, and downstream consumption.
+
+### Standard Star Schema — Reference Architecture
+
+A traditional star schema separates business facts from
+descriptive dimension attributes.
+
+The fact table primarily contains:
+
+- Business keys or surrogate keys.
+- Foreign keys referencing dimension tables.
+- Transactional dates.
+- Business measures.
+
+Descriptive attributes such as hospital_name, patient_city,
+and diagnosis_desc remain in their respective dimension tables.
+
+The following ERD illustrates a conventional star schema
+as a reference architecture rather than the complete
+physical schema implemented in this project.
 
 ```mermaid
 erDiagram
@@ -481,83 +504,206 @@ erDiagram
     }
 ```
 
-The diagram illustrates the logical relationships between the
-fact table and its associated dimensions. Selected business
-columns are shown for readability.
+In a conventional Medallion Architecture, cleaned fact
+and dimension entities may be prepared in Silver and
+published as a business-ready star schema in Gold.
 
-#### Model Grain and Update Strategy
+Fact construction may involve dimension lookups or joins
+to resolve surrogate keys. However, descriptive dimension
+attributes are not duplicated in the fact table.
 
-| Model | Grain | Business Key | Update Strategy |
+```mermaid
+flowchart TD
+    subgraph Bronze
+        B[brz_visit]
+    end
+
+    subgraph Silver
+        B --> V["Cleaned Visit"]
+        P["dim_patient"]
+        H["dim_hospital"]
+        D["dim_diagnosis"]
+    end
+
+    subgraph Gold["Gold - Star Schema"]
+        V --> F["fact_visit - Keys and Measures"]
+        P --> GP["dim_patient - Attributes"]
+        H --> GH["dim_hospital - Attributes"]
+        D --> GD["dim_diagnosis - Attributes"]
+    end
+
+    F --> BI["BI / Semantic Model"]
+    GP --> BI
+    GH --> BI
+    GD --> BI
+```
+
+The Gold fact and dimension tables remain separate.
+Analytical joins and aggregations can be performed by
+SQL queries or BI semantic models.
+
+Gold does not necessarily require pre-aggregation.
+
+### Current Project — Silver OBT Architecture
+
+Unlike the traditional star schema reference, this project
+performs denormalization directly in the Silver layer.
+
+The Bronze visit table is joined with three Silver
+dimensions to construct an enriched fact table.
+
+```mermaid
+flowchart TD
+    subgraph Bronze
+        B[brz_visit]
+    end
+
+    subgraph Silver
+        P["dim_patient - SCD1"]
+        H["dim_hospital - SCD1"]
+        D["dim_diagnosis - SCD1"]
+
+        B --> J[LEFT JOIN]
+        P --> J
+        H --> J
+        D --> J
+
+        J --> F["fact_visit - Denormalized OBT"]
+    end
+
+    subgraph Gold
+        F --> G["gold_hospital_disease_kpi"]
+    end
+```
+
+The Silver fact_visit table contains both transactional
+facts and descriptive dimension attributes.
+
+| Attribute Category | Columns |
+| :--- | :--- |
+| Primary Key | visit_id |
+| Foreign Keys | patient_id, hospital_id, diagnosis_code |
+| Transactional Dates | admission_date, discharge_date |
+| Business Measures | cost |
+| Patient Attributes | patient_first_last_name_masked, patient_city, gender, dob |
+| Hospital Attributes | hospital_name, hospital_city, bed_count |
+| Diagnosis Attributes | diagnosis_desc |
+| Audit Metadata | _ingested_at, silver_load_timestamp |
+
+The resulting table maintains one row per hospital visit
+while providing the descriptive attributes required for
+downstream analytical processing.
+
+The Gold layer directly consumes this enriched fact table
+without repeating the dimension joins.
+
+### Layer Responsibilities & Attribute Distribution
+
+Medallion Architecture defines data processing layers,
+whereas star schema and OBT define data modeling strategies.
+
+These concepts are independent. A star schema or an OBT
+can be implemented in Silver or Gold depending on the
+architecture and business requirements.
+
+| Layer | Traditional Gold Star Schema | Gold OBT Alternative | Current Project |
 | :--- | :--- | :--- | :--- |
-| dim_patient | One row per patient | patient_id | SCD Type 1 |
-| dim_hospital | One row per hospital | hospital_id | SCD Type 1 |
-| dim_diagnosis | One row per diagnosis | diagnosis_code | SCD Type 1 |
-| fact_visit | One row per hospital visit | visit_id | Incremental Upsert |
+| Bronze | Cleaned source tables | Cleaned source tables | Cleaned source tables |
+| Silver Dimensions | Independent dimensions | Independent dimensions | SCD Type 1 dimensions |
+| Silver Fact | Keys and measures | Keys and measures | Keys, measures and dimension attributes |
+| Gold Fact | Keys and measures | Denormalized OBT | Not required |
+| Gold Dimensions | Separate dimension tables | Embedded in OBT | Not required |
+| Dimension JOIN | Fact key resolution or analytical queries | Gold transformation | Silver transformation |
+| Business Aggregation | SQL or BI semantic model | SQL, BI or KPI marts | Gold KPI table |
 
-All four models use incremental MERGE processing.
+The current Silver fact_visit is therefore functionally
+similar to a Gold OBT in an alternative architecture.
 
-The dimension models maintain the latest business state without
-retaining historical versions. Historical patient changes are
-tracked separately through dbt snapshots using SCD Type 2.
+The main difference is that denormalization is performed
+earlier in the pipeline.
 
-#### Audit Timestamps
+### Design Comparison — Star Schema vs OBT
+
+| Aspect | Traditional Star Schema | Current OBT-style Design |
+| :--- | :--- | :--- |
+| Fact Grain | One row per visit | One row per visit |
+| Foreign Keys | Retained | Retained |
+| Dimension Attributes | Stored separately | Embedded in fact table |
+| Denormalization | Not required | Performed in Silver |
+| Analytical Joins | Required when accessing dimension attributes | Not required for existing attributes |
+| Data Redundancy | Lower | Higher |
+| Downstream SQL | May require dimension joins | Direct filtering and aggregation |
+| Dimension Change Propagation | Latest attributes available through SCD1 dimension joins | Requires fact reprocessing |
+| Referential Integrity | Required | Required |
+| Typical Consumption | BI semantic models and dimensional warehouses | SQL analytics and KPI marts |
+
+Both approaches are valid data modeling strategies.
+
+The current project intentionally performs denormalization
+in Silver to simplify downstream Gold transformations.
+
+### Model Grain and Update Strategy
+
+| Model | Layer | Grain | Business Key | Update Strategy |
+| :--- | :--- | :--- | :--- | :--- |
+| dim_patient | Silver | One row per patient | patient_id | SCD Type 1 |
+| dim_hospital | Silver | One row per hospital | hospital_id | SCD Type 1 |
+| dim_diagnosis | Silver | One row per diagnosis | diagnosis_code | SCD Type 1 |
+| fact_visit | Silver | One row per hospital visit | visit_id | Incremental Upsert |
+
+All four Silver models use incremental MERGE processing.
+
+The dimension models maintain the latest business state
+without retaining historical versions.
+
+Historical patient changes are tracked separately through
+dbt snapshots using SCD Type 2.
+
+### Audit Timestamps
 
 | Column | Purpose |
 | :--- | :--- |
 | `_ingested_at` | Original ingestion timestamp used for incremental filtering and deduplication |
 | `silver_load_timestamp` | Silver processing timestamp used for auditing and pipeline monitoring |
 
-#### PII Protection
+The original ingestion timestamp is preserved throughout
+Silver processing.
 
-Original patient names are retained in the restricted Source
-and Bronze layers.
+The silver_load_timestamp records when a record is
+inserted or updated in the Silver layer.
+
+### PII Protection
+
+Original patient names are retained in the Source and
+Bronze layers, where access should be restricted.
 
 In the Silver layer, first_name and last_name are excluded
 from the output and replaced with a SHA256 hash.
 
-This reduces direct exposure of patient names in downstream
-analytical models.
+The denormalized fact table inherits the hashed patient
+name rather than the original personally identifiable
+information.
+
+The Gold KPI table does not require patient names or
+hashed patient names.
+
+| Layer | Original Patient Names | Hashed Patient Name |
+| :--- | :--- | :--- |
+| Source | Retained | Not required |
+| Bronze | Retained | Not required |
+| Silver Dimensions | Removed | Retained in dim_patient |
+| Silver Fact | Removed | Retained |
+| Snapshot | Removed | Retained |
+| Gold | Removed | Not required |
 
 Hashing provides pseudonymization rather than complete
 anonymization. Appropriate access controls remain necessary.
 
-#### Data Modeling Strategy — Star Schema vs OBT
+### Design Rationale
 
-This project adopts a hybrid data modeling approach that
-combines independently maintained SCD Type 1 dimensions
-with a denormalized, OBT-style fact table.
-
-Unlike a traditional star schema, where the fact table
-primarily stores foreign keys and business measures,
-`fact_visit` also contains descriptive attributes from
-the patient, hospital, and diagnosis dimensions.
-
-```mermaid
-flowchart TD
-    B[brz_visit] --> J[LEFT JOIN]
-    P[dim_patient] --> J
-    H[dim_hospital] --> J
-    D[dim_diagnosis] --> J
-    J --> F["fact_visit - Denormalized OBT"]
-    F --> G[Gold KPI Aggregation]
-```
-
-##### Design Comparison
-
-| Aspect | Traditional Star Schema | Current OBT-style Design |
-| :--- | :--- | :--- |
-| Fact Grain | One row per visit | One row per visit |
-| Dimension Attributes | Stored separately | Embedded in the fact table |
-| Join Strategy | Query-time joins | Load-time joins |
-| Data Redundancy | Lower | Higher |
-| Downstream Complexity | Higher | Lower |
-| Dimension Change Propagation | Available through joins | Requires fact reprocessing |
-| Referential Integrity | Required | Required |
-
-##### Design Rationale
-
-The denormalized fact table is designed to simplify
-downstream Gold transformations and analytical queries.
+The denormalized fact table simplifies downstream
+analytical processing by incorporating descriptive
+dimension attributes during Silver loading.
 
 Independent dimension tables are retained to support:
 
@@ -567,32 +713,46 @@ Independent dimension tables are retained to support:
 - Referential integrity testing.
 - SCD Type 2 historical tracking for patient attributes.
 
-The Gold layer consumes the enriched fact table directly
-without repeating the dimension joins.
+The Gold layer focuses on business-specific KPI
+calculations and aggregations rather than repeating
+dimension enrichment.
 
-##### Design Trade-offs
+### Design Trade-offs & Known Limitations
 
 Denormalization introduces data redundancy and additional
 storage requirements.
 
-Changes to dimension attributes do not automatically
-propagate to existing fact records unless the affected
-visits are reprocessed.
+Because fact_visit is incrementally processed using the
+visit ingestion timestamp, changes to dimension attributes
+alone do not automatically refresh existing fact records.
 
-This is a known limitation of the current incremental
-OBT-style implementation.
+For example, updating a patient's city in dim_patient
+does not automatically update patient_city in existing
+fact_visit records.
 
-##### ERD vs Data Lineage
+Potential improvements include:
 
-The ERD represents logical primary key and foreign key
-relationships between the fact and dimension tables.
+- Dimension change propagation.
+- Reprocessing affected fact records.
+- Incremental lookback windows.
+- Separating the standard fact table from the enriched OBT.
 
-The data lineage diagram represents the physical
-transformation process used to construct the enriched
-fact table.
+### ERD vs Data Lineage
 
-The logical relationships do not imply that the dimension
-joins must be repeated in downstream transformations.
+The reference ERD illustrates the conventional logical
+primary key and foreign key relationships between
+fact and dimension tables.
+
+The current project's data lineage illustrates the
+physical transformation process used to construct
+the denormalized Silver fact table.
+
+Although the current fact table already contains
+dimension attributes, its foreign keys remain available
+for referential integrity validation.
+
+These logical relationships do not imply that dimension
+joins must be repeated in downstream Gold transformations.
 
 ### Silver Layer — Data Quality Testing
 

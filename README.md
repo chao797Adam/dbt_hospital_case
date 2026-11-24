@@ -1473,7 +1473,127 @@ CREATE TABLE z_dbt_hospital_prod.source.visit     AS SELECT * FROM z_dbt_hospita
 
 > **Note:** For a production-grade setup, Auto Loader should be parameterized to write to `{catalog}.source.*` and run separately per environment. CTAS is a one-time shortcut for demonstration.
 
-### 11.3 Environment Isolation Test
+### 11.3 Snapshot Migration — DEEP CLONE
+
+Unlike regular dbt models, snapshots maintain historical
+state accumulated across multiple executions.
+
+Running `dbt run --target prod` rebuilds the Bronze,
+Silver, and Gold models, but does not migrate existing
+SCD Type 2 historical records.
+
+Running `dbt snapshot --target prod` against a new
+environment only captures the current dimension state.
+Previously captured historical versions are not
+automatically reconstructed.
+
+#### Migration Strategy by Layer
+
+| Layer | Migration Method | Rationale |
+| :--- | :--- | :--- |
+| Source | CTAS | Copy existing raw data |
+| Bronze | dbt run | Rebuild typed source data |
+| Silver | dbt run | Rebuild current-state dimensions and facts |
+| Gold | dbt run | Recalculate business KPIs |
+| Snapshots | DEEP CLONE | Preserve accumulated SCD2 history |
+
+#### Preserve Snapshot History
+
+For a one-time environment migration, Databricks
+DEEP CLONE can be used to copy the existing snapshot
+table into the production catalog.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS z_dbt_hospital_prod.snapshots;
+
+CREATE TABLE IF NOT EXISTS
+    z_dbt_hospital_prod.snapshots.dim_patient_snapshot
+DEEP CLONE
+    z_dbt_hospital.snapshots.dim_patient_snapshot;
+```
+
+DEEP CLONE creates an independent copy of the Delta
+table, preserving the existing historical records
+and dbt snapshot metadata:
+
+- `dbt_scd_id`
+- `dbt_updated_at`
+- `dbt_valid_from`
+- `dbt_valid_to`
+
+The cloned table does not inherit the original
+table's full Delta transaction history.
+
+#### Initial Production Deployment
+
+After migrating the Source tables and cloning the
+snapshot, execute:
+
+```bash
+dbt run --target prod
+dbt snapshot --target prod
+dbt test --target prod
+```
+
+The production snapshot must resolve to the production
+catalog. The Source data and cloned snapshot should
+represent a consistent migration point.
+
+#### Migration Validation
+
+```sql
+SELECT
+    patient_id,
+    city,
+    dbt_valid_from,
+    dbt_valid_to
+FROM z_dbt_hospital_prod.snapshots.dim_patient_snapshot
+WHERE patient_id = 'P001'
+ORDER BY dbt_valid_from;
+```
+
+Expected result after migration:
+
+| Patient ID | City | Status |
+| :--- | :--- | :--- |
+| P001 | Mumbai | Historical |
+| P001 | Pune | Current |
+
+Both historical and current versions should be
+preserved in the production environment.
+
+Actual migration results should be captured
+after execution.
+
+#### Production Deployment Considerations
+
+DEEP CLONE is intended here as a one-time migration
+strategy for demonstration purposes, not a recurring
+CI/CD deployment step.
+
+In a real production environment:
+
+- Deploy transformation code rather than development data.
+- Maintain independent snapshots in each environment.
+- Do not overwrite production snapshot history with
+  development or test data.
+- Execute production snapshots independently after
+  the relevant upstream models have been updated.
+- Migrate historical data only when explicitly required
+  and validated.
+
+#### Key Design Principle
+
+Regular dbt models are generally rebuildable from
+available source data and transformation logic.
+
+Snapshots are stateful historical datasets whose
+contents depend on previously captured changes.
+
+Therefore, model deployment and historical data
+migration require different strategies.
+
+### 11.4 Environment Isolation Test
 
 To verify that `dev` and `prod` are truly isolated, a test row was inserted only into `prod`:
 
@@ -1503,7 +1623,7 @@ SELECT * FROM z_dbt_hospital.bronze.brz_diagnosis WHERE diagnosis_code = 'D999';
 
 **Conclusion:** The test demonstrates separate catalog data for the tested model path. Full isolation also depends on target-aware model and snapshot configuration, permissions and ingestion paths.
 
-### 11.4 `sources.yml` Uses `target.catalog`
+### 11.5 `sources.yml` Uses `target.catalog`
 
 To ensure dbt reads from the correct catalog per environment, `sources.yml` uses a Jinja variable:
 
@@ -1526,7 +1646,7 @@ sources:
 | `dev` | `z_dbt_hospital` | `z_dbt_hospital.source.*` |
 | `prod` | `z_dbt_hospital_prod` | `z_dbt_hospital_prod.source.*` |
 
-### 11.5 Deployment Commands
+### 11.6 Deployment Commands
 
 ```bash
 # Deploy to dev

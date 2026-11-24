@@ -318,7 +318,8 @@ QUALIFY ROW_NUMBER() OVER (
 SELECT
     diagnosis_code,
     diagnosis_desc,
-    _ingested_at
+    _ingested_at,
+    current_timestamp() as silver_load_timestamp
 FROM {{ ref('brz_diagnosis') }}
 {% if is_incremental() %}
 WHERE _ingested_at > (
@@ -342,7 +343,8 @@ SELECT
     hospital_name,
     city,
     bed_count,
-    _ingested_at
+    _ingested_at,
+    current_timestamp() as silver_load_timestamp
 FROM {{ ref('brz_hospital') }}
 {% if is_incremental() %}
 WHERE _ingested_at > (
@@ -369,7 +371,8 @@ SELECT
     dob,
     city,
     SHA2(CONCAT_WS('|', first_name, last_name), 256) AS patient_first_last_name_masked,
-    _ingested_at
+    _ingested_at,
+    current_timestamp() as silver_load_timestamp
 FROM {{ ref('brz_patient') }}
 {% if is_incremental() %}
 WHERE _ingested_at > (

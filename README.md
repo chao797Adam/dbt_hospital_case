@@ -1386,17 +1386,108 @@ dbt test
 
 **Both approaches are valid.** Asset Bundle is suitable for teams managing many Notebook-based Jobs. dbt is suitable for SQL-heavy transformations with built-in lineage and testing.
 
-## 9. Tools Used
+### 8.5 Architecture Comparison — Streaming vs. Hybrid Processing
 
-| Tool | Purpose |
-| :--- | :--- |
-| **Databricks Volumes** | Store raw CSV files |
-| **Auto Loader (cloudFiles)** | Incremental CSV ingestion |
-| **Delta Lake** | Storage format |
-| **dbt (dbt-databricks)** | SQL transformations, SCD1, SCD2 snapshots, tests, docs |
-| **Databricks SQL Warehouse** | Query engine for dbt |
+The reference implementation uses Structured Streaming
+for raw data ingestion and Bronze-to-Silver processing.
 
-## 10. How to Run
+This project adopts a hybrid architecture that combines
+streaming ingestion with batch-based dbt transformations.
+
+#### Reference Architecture
+
+```text
+Raw CSV (ADLS)
+    |
+    | Auto Loader + Checkpoint
+    v
+Bronze (Raw Delta Tables)
+    |
+    | Structured Streaming + Checkpoint
+    v
+Silver (Dimensions / Fact)
+    |
+    | Downstream Transformation
+    v
+Gold (Business KPIs)
+```
+
+#### This Project
+
+```text
+Raw CSV (Databricks Volume)
+    |
+    | Auto Loader + Checkpoint
+    v
+Source (Raw Delta Tables)
+    |
+    | dbt Schema Casting
+    v
+Bronze (Typed Schema)
+    |
+    | dbt Incremental MERGE
+    | Watermark: MAX(_ingested_at)
+    v
+Silver (SCD1 Dimensions + OBT)
+    |
+    +-------------------------+
+    |                         |
+    | dbt snapshot            | dbt Table Rebuild
+    v                         v
+Snapshots (SCD2)         Gold (Business KPIs)
+```
+
+#### Checkpoint vs. Watermark
+
+| Aspect | Reference | This Project |
+| :--- | :--- | :--- |
+| Architecture | Streaming-based | Hybrid |
+| Raw Delta Layer | Bronze | Source |
+| Schema Casting | Downstream Transformation | Dedicated Bronze Layer |
+| Ingestion Tracking | Auto Loader Checkpoint | Auto Loader Checkpoint |
+| Downstream Incremental Tracking | Streaming Checkpoint | SQL Watermark |
+| Progress Storage | Checkpoint Files | MAX(_ingested_at) in Target Table |
+| Checkpoint Management | Per Independent Streaming Query | Ingestion Only |
+| Transformation Execution | Streaming / Micro-batch | Batch |
+
+Each independent Structured Streaming query requires
+its own checkpoint to track processing progress and
+support recovery.
+
+This project maintains four independent checkpoints
+for Source ingestion: diagnosis, hospital, patient,
+and visit.
+
+Downstream incremental processing is managed by dbt
+using `_ingested_at` as a watermark, without requiring
+additional streaming checkpoints.
+
+#### Design Trade-offs
+
+The hybrid architecture provides:
+
+- Separation of raw ingestion and schema standardization.
+- Reduced downstream streaming checkpoint management.
+- SQL-based transformations and dimensional modeling.
+- Integration with dbt testing, snapshots, and lineage.
+- Suitability for scheduled analytical workloads.
+
+However, watermark-based processing requires careful
+handling of late-arriving records and timestamp boundaries.
+Periodic snapshots may also miss intermediate changes.
+
+Streaming-based processing is more suitable when
+low-latency data availability is required, although
+it introduces additional streaming state management.
+
+**Key principle: Incremental processing does not
+necessarily require streaming.**
+
+For this hospital analytics workload, batch-based
+transformations provide sufficient data freshness
+while reducing downstream streaming complexity.
+
+## 9. How to Run
 
 ```bash
 # 1. Ingest raw CSVs into `source` schema
@@ -1417,14 +1508,11 @@ dbt run --select gold
 # 6. Test
 dbt test
 
-# 7. Generate docs
-dbt docs generate
-dbt docs serve
 ```
 
-## 11. Deployment
+## 10. Deployment
 
-### 11.1 Multi-Environment Setup
+### 10.1 Multi-Environment Setup
 
 The project uses **two catalogs** for isolation:
 
@@ -1458,7 +1546,7 @@ dbt run --target dev
 dbt run --target prod
 ```
 
-### 11.2 Source Tables in prod
+### 10.2 Source Tables in prod
 
 Since dbt's `source` tables are created by **Auto Loader** (not by dbt), the `prod` catalog requires its own `source` schema. For a one-time migration, CTAS was used:
 
@@ -1473,7 +1561,7 @@ CREATE TABLE z_dbt_hospital_prod.source.visit     AS SELECT * FROM z_dbt_hospita
 
 > **Note:** For a production-grade setup, Auto Loader should be parameterized to write to `{catalog}.source.*` and run separately per environment. CTAS is a one-time shortcut for demonstration.
 
-### 11.3 Snapshot Migration — DEEP CLONE
+### 10.3 Snapshot Migration — DEEP CLONE
 
 Unlike regular dbt models, snapshots maintain historical
 state accumulated across multiple executions.
@@ -1593,7 +1681,7 @@ contents depend on previously captured changes.
 Therefore, model deployment and historical data
 migration require different strategies.
 
-### 11.4 Environment Isolation Test
+### 10.4 Environment Isolation Test
 
 To verify that `dev` and `prod` are truly isolated, a test row was inserted only into `prod`:
 
@@ -1623,7 +1711,7 @@ SELECT * FROM z_dbt_hospital.bronze.brz_diagnosis WHERE diagnosis_code = 'D999';
 
 **Conclusion:** The test demonstrates separate catalog data for the tested model path. Full isolation also depends on target-aware model and snapshot configuration, permissions and ingestion paths.
 
-### 11.5 `sources.yml` Uses `target.catalog`
+### 10.5 `sources.yml` Uses `target.catalog`
 
 To ensure dbt reads from the correct catalog per environment, `sources.yml` uses a Jinja variable:
 
@@ -1646,7 +1734,7 @@ sources:
 | `dev` | `z_dbt_hospital` | `z_dbt_hospital.source.*` |
 | `prod` | `z_dbt_hospital_prod` | `z_dbt_hospital_prod.source.*` |
 
-### 11.6 Deployment Commands
+### 10.6 Deployment Commands
 
 ```bash
 # Deploy to dev
@@ -1663,7 +1751,7 @@ dbt test --target prod
 dbt run --target prod --full-refresh
 ```
 
-## 12. Genie: Natural Language BI
+## 11. Genie: Natural Language BI
 
 The Gold table `gold_hospital_disease_kpi` and the Silver table `fact_visit` are exposed to **Databricks Genie** for natural-language BI.
 
@@ -1683,7 +1771,7 @@ Four questions were asked via Genie in the earlier implementation. The captured 
 - Genie auto-generates SQL from natural language, lowering the barrier for business users.
 - Q3 and Q4 require visit-level dates. Q3 should use patient ID rather than raw patient names; review the existing PDF for identifying information before publishing. Genie-generated SQL must be checked against the same readmission definition.
 
-## 13. Dashboard
+## 12. Dashboard
 
 A Databricks Dashboard was built on top of `gold_hospital_disease_kpi` with four visualizations:
 
@@ -1698,7 +1786,7 @@ The dashboard is stored in the Databricks Workspace and is scheduled to send dai
 
 Snapshot: `assets/dashboard.png` (earlier implementation). Refresh after rerunning the revised models. Hospital-level rates must use summed numerators and denominators.
 
-## 14. Data Quality and Known Limitations
+## 13. Data Quality and Known Limitations
 
 The original dataset contains 5 diagnosis, 5 hospital, 5 patient and 8 visit records. These are baseline source counts, not post-test counts.
 

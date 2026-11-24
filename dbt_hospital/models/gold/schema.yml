@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: gold_hospital_disease_kpi
+    description: "Hospital and diagnosis level KPI aggregation"
+
+    columns:
+      - name: hospital_id
+        data_tests:
+          - not_null
+
+      - name: diagnosis_code
+        data_tests:
+          - not_null
+
+      - name: total_visits
+        data_tests:
+          - not_null
+
+      - name: total_readmissions
+        data_tests:
+          - not_null
+
+      - name: readmission_rate
+        data_tests:
+          - not_null

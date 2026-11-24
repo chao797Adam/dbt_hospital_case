@@ -934,58 +934,48 @@ Implementation:
 ```sql
 {{ config(materialized='table') }}
 
-WITH visit_with_prev AS (
-    SELECT
-        visit_id,
-        patient_id,
-        hospital_id,
-        admission_date,
-        discharge_date,
-        LAG(discharge_date) OVER (
-            PARTITION BY patient_id, diagnosis_code
-            ORDER BY admission_date, visit_id
-        ) AS previous_discharge,
-        diagnosis_code,
-        cost,
-        _ingested_at,
-        patient_first_last_name_masked,
-        patient_city,
-        gender,
-        dob,
-        hospital_name,
-        hospital_city,
-        bed_count,
-        diagnosis_desc,
-        silver_load_timestamp
-    FROM {{ ref('fact_visit') }}
-),
+with
+    visit_with_prev as (
+        select
+            visit_id,
+            patient_id,
+            hospital_id,
+            hospital_name,
+            diagnosis_code,
+            diagnosis_desc,
+            admission_date,
+            discharge_date,
+            cost,
+            lag(discharge_date) over (
+                partition by patient_id, diagnosis_code order by admission_date
+            ) as previous_discharge
+        from {{ ref('fact_visit') }}
+    ),
+    visit_flagged as (
+        select
+            *,
+            datediff(admission_date, previous_discharge) as days_since_last_visit,
+            case
+                when datediff(admission_date, previous_discharge) between 0 and 30
+                then 1
+                else 0
+            end as is_readmission_30d
+        from visit_with_prev
+    )
 
-visit_flagged AS (
-    SELECT
-        *,
-        DATEDIFF(admission_date, previous_discharge) AS days_since_last_visit,
-        CASE
-            WHEN DATEDIFF(admission_date, previous_discharge)
-            BETWEEN 0 AND 30
-            THEN 1
-            ELSE 0
-        END AS is_readmission_30d
-    FROM visit_with_prev
-)
-
-SELECT
+select
     hospital_id,
     hospital_name,
     diagnosis_code,
     diagnosis_desc,
-    COUNT(*) AS total_visits,
-    SUM(is_readmission_30d) AS total_readmissions,
-    SUM(is_readmission_30d) * 1.0 / COUNT(*) AS readmission_rate,
-    SUM(cost) AS total_cost,
-    AVG(cost) AS avg_cost,
-    CURRENT_TIMESTAMP() AS gold_load_timestamp
-FROM visit_flagged
-GROUP BY hospital_id, hospital_name, diagnosis_code, diagnosis_desc
+    count(*) as total_visits,
+    sum(is_readmission_30d) as total_readmissions,
+    round(sum(is_readmission_30d) * 1.0 / count(*), 3) as readmission_rate,
+    round(sum(cost), 2) as total_cost,
+    round(avg(cost), 2) as avg_cost,
+    current_timestamp() as gold_load_timestamp
+from visit_flagged
+group by hospital_id, hospital_name, diagnosis_code, diagnosis_desc
 ```
 
 ### Output Schema
@@ -1002,6 +992,127 @@ GROUP BY hospital_id, hospital_name, diagnosis_code, diagnosis_desc
 | `total_cost` | Sum of costs |
 | `avg_cost` | Average cost per visit |
 | `gold_load_timestamp` | Gold table generation time |
+
+### Gold Layer — Data Quality Testing
+
+Unlike the Silver layer, which focuses on primary key
+uniqueness and referential integrity, the Gold layer
+focuses on business KPI validation and aggregation integrity.
+
+#### Generic Tests
+
+File: `models/gold/schema.yml`
+
+```yaml
+version: 2
+
+models:
+  - name: gold_hospital_disease_kpi
+    description: "Hospital and diagnosis level KPI aggregation"
+
+    columns:
+      - name: hospital_id
+        data_tests:
+          - not_null
+
+      - name: diagnosis_code
+        data_tests:
+          - not_null
+
+      - name: total_visits
+        data_tests:
+          - not_null
+
+      - name: total_readmissions
+        data_tests:
+          - not_null
+
+      - name: readmission_rate
+        data_tests:
+          - not_null
+```
+
+The intended Gold model grain is one row per hospital
+per diagnosis.
+
+Neither hospital_id nor diagnosis_code is individually
+unique because each hospital may have multiple diagnoses.
+
+#### Singular Test — Business Rule Validation
+
+File: `tests/assert_hospital_kpi_valid.sql`
+
+```sql
+select *
+from {{ ref('gold_hospital_disease_kpi') }}
+where
+    total_visits <= 0
+    or total_readmissions < 0
+    or total_readmissions > total_visits
+    or readmission_rate < 0
+    or readmission_rate > 1
+    or total_cost < 0
+```
+
+This singular test validates the logical consistency
+of the aggregated business metrics.
+
+A dbt singular test passes when the query returns zero rows.
+
+#### Business Validation Rules
+
+| KPI | Validation Rule |
+| :--- | :--- |
+| total_visits | Must be greater than zero |
+| total_readmissions | Must be non-negative |
+| total_readmissions | Must not exceed total_visits |
+| readmission_rate | Must be between 0 and 1 |
+| total_cost | Must be non-negative |
+
+#### Test Execution
+
+```bash
+dbt run --select gold
+dbt test --select gold
+```
+
+Alternatively:
+
+```bash
+dbt build --select gold
+```
+
+#### Expected Validation Results
+
+| Test Category | Expected Tests |
+| :--- | ---: |
+| Generic Tests (not_null) | 5 |
+| Singular Test (Business Rules) | 1 |
+| **Total** | **6** |
+
+Actual execution results will be recorded after validation.
+
+#### Cross-Layer Data Quality Strategy
+
+| Layer | Validation Focus | Test Type | Number of Tests |
+| :--- | :--- | :--- | ---: |
+| Silver | Primary Key Uniqueness | unique | 4 |
+| Silver | Mandatory Keys | not_null | 7 |
+| Silver | Referential Integrity | relationships | 3 |
+| Gold | Mandatory KPI Fields | not_null | 5 |
+| Gold | Business Rule Validation | Singular Test | 1 |
+| **Total** | | | **20** |
+
+The testing strategy separates structural data quality
+from business-level validation.
+
+Silver tests ensure that the underlying entities and
+relationships are valid, while Gold tests ensure that
+the aggregated KPIs satisfy the defined business rules.
+
+This provides automated data quality validation across
+the transformation pipeline without requiring additional
+dbt packages.
 
 ### BI Questions Answered
 
